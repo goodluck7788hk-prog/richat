@@ -4,7 +4,7 @@ use {
         MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
         v0::MessageAddressTableLookup,
     },
-    solana_message_v3::{
+    solana_message::{
         MessageHeader as StatusMessageHeader, VersionedMessage as StatusVersionedMessage,
         compiled_instruction::CompiledInstruction as StatusCompiledInstruction,
         v0::MessageAddressTableLookup as StatusMessageAddressTableLookup,
@@ -12,13 +12,13 @@ use {
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
+    solana_transaction::versioned::VersionedTransaction as StatusVersionedTransaction,
     solana_transaction_context::transaction::TransactionReturnData,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
         InnerInstruction, InnerInstructions, Reward, RewardType, TransactionStatusMeta,
         TransactionTokenBalance,
     },
-    solana_transaction_v3::versioned::VersionedTransaction as StatusVersionedTransaction,
     yellowstone_grpc_proto::prelude as proto,
 };
 
@@ -57,6 +57,9 @@ pub fn create_status_transaction(tx: &StatusVersionedTransaction) -> proto::Tran
                 versioned: true,
                 address_table_lookups: create_status_lookups(&message.address_table_lookups),
             },
+            StatusVersionedMessage::V1(_) => {
+                unimplemented!("V1 transaction messages are not supported")
+            }
         }),
     }
 }
@@ -297,6 +300,7 @@ pub const fn create_reward_type(reward_type: Option<RewardType>) -> proto::Rewar
         Some(RewardType::Rent) => proto::RewardType::Rent,
         Some(RewardType::Staking) => proto::RewardType::Staking,
         Some(RewardType::Voting) => proto::RewardType::Voting,
+        Some(RewardType::DeactivatedStake) => proto::RewardType::Staking,
     }
 }
 

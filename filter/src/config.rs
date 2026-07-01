@@ -470,6 +470,8 @@ pub enum ConfigFilterError {
     Signature(String, ParseSignatureError),
     #[error("Unknown commitment level: {0}")]
     UnknownCommitment(i32),
+    #[error("Unsupported filter field: {0}")]
+    UnsupportedFilterField(&'static str),
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -612,6 +614,11 @@ impl TryFrom<SubscribeRequestFilterAccounts> for ConfigFilterAccounts {
     type Error = ConfigFilterError;
 
     fn try_from(value: SubscribeRequestFilterAccounts) -> Result<Self, Self::Error> {
+        if value.cuckoo_accounts_filter.is_some() {
+            return Err(ConfigFilterError::UnsupportedFilterField(
+                "cuckoo_accounts_filter",
+            ));
+        }
         let account = ConfigFilter::parse_vec_pubkeys(value.account)?;
         let owner = ConfigFilter::parse_vec_pubkeys(value.owner)?;
 
@@ -641,6 +648,7 @@ impl From<ConfigFilterAccounts> for SubscribeRequestFilterAccounts {
             owner: ConfigFilter::conv_vec_pubkeys(value.owner),
             filters: value.filters.into_iter().map(Into::into).collect(),
             nonempty_txn_signature: value.nonempty_txn_signature,
+            cuckoo_accounts_filter: None,
         }
     }
 }
@@ -859,6 +867,9 @@ impl TryFrom<SubscribeRequestFilterTransactions> for ConfigFilterTransactions {
     type Error = ConfigFilterError;
 
     fn try_from(value: SubscribeRequestFilterTransactions) -> Result<Self, Self::Error> {
+        if value.token_accounts.is_some() {
+            return Err(ConfigFilterError::UnsupportedFilterField("token_accounts"));
+        }
         Ok(Self {
             vote: value.vote,
             failed: value.failed,
@@ -884,6 +895,7 @@ impl From<ConfigFilterTransactions> for SubscribeRequestFilterTransactions {
             account_include: ConfigFilter::conv_vec_pubkeys(value.account_include),
             account_exclude: ConfigFilter::conv_vec_pubkeys(value.account_exclude),
             account_required: ConfigFilter::conv_vec_pubkeys(value.account_required),
+            token_accounts: None,
         }
     }
 }
@@ -902,6 +914,11 @@ impl TryFrom<SubscribeRequestFilterBlocks> for ConfigFilterBlocks {
     type Error = ConfigFilterError;
 
     fn try_from(value: SubscribeRequestFilterBlocks) -> Result<Self, Self::Error> {
+        if value.cuckoo_account_include.is_some() {
+            return Err(ConfigFilterError::UnsupportedFilterField(
+                "cuckoo_account_include",
+            ));
+        }
         Ok(Self {
             account_include: ConfigFilter::parse_vec_pubkeys(value.account_include)?,
             include_transactions: value.include_transactions,
@@ -918,6 +935,7 @@ impl From<ConfigFilterBlocks> for SubscribeRequestFilterBlocks {
             include_transactions: value.include_transactions,
             include_accounts: value.include_accounts,
             include_entries: value.include_entries,
+            cuckoo_account_include: None,
         }
     }
 }

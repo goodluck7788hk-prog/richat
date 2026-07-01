@@ -215,6 +215,7 @@ impl ConfigYellowstoneGrpc {
                     owner: vec![],
                     filters: vec![],
                     nonempty_txn_signature: None,
+                    cuckoo_accounts_filter: None,
                 },
             );
         }
@@ -230,6 +231,7 @@ impl ConfigYellowstoneGrpc {
                     account_include: vec![],
                     account_exclude: vec![],
                     account_required: vec![],
+                    token_accounts: None,
                 },
             );
         }

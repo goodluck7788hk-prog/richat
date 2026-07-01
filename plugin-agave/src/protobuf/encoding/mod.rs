@@ -136,6 +136,7 @@ pub const fn reward_type_as_i32(reward_type: Option<RewardType>) -> i32 {
         Some(RewardType::Rent) => 2,
         Some(RewardType::Staking) => 3,
         Some(RewardType::Voting) => 4,
+        Some(RewardType::DeactivatedStake) => 3,
     }
 }
 

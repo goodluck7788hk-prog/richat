@@ -7,7 +7,7 @@ use {
         compiled_instruction::CompiledInstruction,
         v0::{LoadedAddresses, Message as MessageV0, MessageAddressTableLookup},
     },
-    solana_message_v3::{
+    solana_message::{
         Message as StatusMessage, MessageHeader as StatusMessageHeader,
         VersionedMessage as StatusVersionedMessage,
         compiled_instruction::CompiledInstruction as StatusCompiledInstruction,
@@ -19,6 +19,7 @@ use {
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
+    solana_transaction::versioned::VersionedTransaction as StatusVersionedTransaction,
     solana_transaction_context::transaction::TransactionReturnData,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
@@ -26,7 +27,6 @@ use {
         RewardsAndNumPartitions, TransactionStatusMeta, TransactionTokenBalance,
         TransactionWithStatusMeta, VersionedTransactionWithStatusMeta,
     },
-    solana_transaction_v3::versioned::VersionedTransaction as StatusVersionedTransaction,
     yellowstone_grpc_proto::prelude as proto,
 };
 
