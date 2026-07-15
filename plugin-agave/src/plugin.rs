@@ -16,6 +16,7 @@ use {
     richat_metrics::{MaybeRecorder, gauge},
     richat_shared::transports::{grpc::GrpcServer, quic::QuicServer},
     solana_clock::Slot,
+    solana_message::VersionedMessage,
     std::{fmt, sync::Arc, time::Duration},
     tokio::{runtime::Runtime, task::JoinError},
     tokio_util::sync::CancellationToken,
@@ -257,6 +258,14 @@ impl GeyserPlugin for Plugin {
             }
             ReplicaTransactionInfoVersions::V0_0_3(info) => info,
         };
+
+        // richat's protobuf has no representation for V1 transaction messages, and
+        // encoding one hits `unimplemented!()`. Until V1 (SIMD-0385) support lands
+        // upstream, skip such transactions instead of panicking inside the validator.
+        if matches!(transaction.transaction.message, VersionedMessage::V1(_)) {
+            log::warn!("skipping unsupported V1 transaction message at slot {slot}");
+            return Ok(());
+        }
 
         let inner = self.inner.as_ref().expect("initialized");
         inner.messages.push(
