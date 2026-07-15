@@ -118,8 +118,18 @@ fn is_grpc_replay_rejected(status: &tonic::Status) -> bool {
             msg.contains("first available slot")
                 || msg.contains("failed to get replay position for slot")
         }
-        // dragons mouth: broadcast from {from_slot} is not available, last available: {first_available}
+        // dragons mouth (richat-native / older yellowstone-grpc):
+        //   Internal "broadcast from {from_slot} is not available, last available: {first_available}"
+        // dragons mouth (yellowstone-grpc v14, replay_stored_slots == 0):
+        //   Internal "from_slot is not supported"
         Code::Internal => {
+            let msg = status.message();
+            msg.contains("is not available, last available")
+                || msg.contains("from_slot is not supported")
+        }
+        // dragons mouth (yellowstone-grpc v14, requested slot older than the replay buffer):
+        //   OutOfRange "broadcast from {from_slot} is not available, last available: {slot}"
+        Code::OutOfRange => {
             let msg = status.message();
             msg.contains("is not available, last available")
         }
