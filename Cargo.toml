@@ -23,8 +23,8 @@ publish = false
 
 [workspace.dependencies]
 affinity-linux = "1.0.0"
-agave-geyser-plugin-interface = "=4.1.0" # agave repo
-agave-reserved-account-keys = "=4.1.0" # agave repo
+agave-geyser-plugin-interface = "=4.2.0" # agave repo
+agave-reserved-account-keys = "=4.2.0" # agave repo
 anyhow = "1.0.62"
 arrayvec = "0.7.6"
 base64 = "0.22.1"
@@ -84,7 +84,7 @@ signal-hook = "0.4.3"
 smallvec = "1.13.2"
 socket2 = "0.6.0"
 solana-account = "4.0.0"
-solana-account-decoder = "=4.1.0" # agave repo
+solana-account-decoder = "=4.2.0" # agave repo
 solana-clock = "3.0.0"
 solana-commitment-config = "3.0.0"
 solana-hash = "4.3.0"
@@ -92,15 +92,15 @@ solana-logger = "3.0.0"
 solana-message = "4.1.0"
 solana-nohash-hasher = "0.2.1"
 solana-pubkey = "4.2.0"
-solana-pubsub-client = "=4.1.0" # agave repo
-solana-rpc-client-api = "=4.1.0" # agave repo
+solana-pubsub-client = "=4.2.0" # agave repo
+solana-rpc-client-api = "=4.2.0" # agave repo
 solana-signature = "3.4.0"
-solana-storage-proto = "=4.1.0" # agave repo
+solana-storage-proto = "=4.2.0" # agave repo
 solana-transaction = "4.1.1"
-solana-transaction-context = "=4.1.0" # agave repo
-solana-transaction-error = "=3.2.0"
-solana-transaction-status = "=4.1.0" # agave repo
-solana-version = "=4.1.0" # agave repo
+solana-transaction-context = "=4.2.0" # agave repo
+solana-transaction-error = "=3.3.2"
+solana-transaction-status = "=4.2.0" # agave repo
+solana-version = "=4.2.0" # agave repo
 spl-token-2022-interface = "2.1.0"
 thiserror = "2.0.7"
 tikv-jemallocator = { version = "0.6.0", features = ["unprefixed_malloc_on_supported_platforms"] }
