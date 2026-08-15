@@ -12,7 +12,7 @@ publish = { workspace = true }
 
 [dependencies]
 affinity-linux = { workspace = true }
-agave-reserved-account-keys = { workspace = true }
+agave-reserved-account-keys = { workspace = true, features = ["agave-unstable-api"] }
 anyhow = { workspace = true }
 arrayvec = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -45,21 +45,18 @@ serde_json = { workspace = true, features = ["raw_value"] }
 signal-hook = { workspace = true }
 smallvec = { workspace = true }
 solana-account = { workspace = true }
-solana-account-decoder = { workspace = true }
-solana-account-v3 = { workspace = true }
+solana-account-decoder = { workspace = true, features = ["agave-unstable-api"] }
 solana-clock = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-message = { workspace = true }
-solana-message-v3 = { workspace = true }
 solana-nohash-hasher = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-signature = { workspace = true }
 solana-transaction = { workspace = true }
 solana-transaction-error = { workspace = true }
-solana-transaction-status = { workspace = true }
-solana-transaction-v3 = { workspace = true }
-solana-version = { workspace = true }
+solana-transaction-status = { workspace = true, features = ["agave-unstable-api"] }
+solana-version = { workspace = true, features = ["agave-unstable-api"] }
 spl-token-2022-interface = { workspace = true }
 thiserror = { workspace = true }
 tikv-jemallocator = { workspace = true }

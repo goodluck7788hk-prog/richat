@@ -4,7 +4,7 @@ pub mod fixtures {
             ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaEntryInfoV2, ReplicaTransactionInfoV3,
             SlotStatus as GeyserSlotStatus,
         },
-        prost_011::Message,
+        prost::Message,
         richat_proto::{
             convert_to,
             geyser::{
@@ -15,16 +15,16 @@ pub mod fixtures {
         },
         solana_clock::Slot,
         solana_hash::{HASH_BYTES, Hash},
-        solana_message_v3::{SimpleAddressLoader, v0::LoadedAddresses},
+        solana_message::{SimpleAddressLoader, v0::LoadedAddresses},
         solana_pubkey::Pubkey,
         solana_signature::Signature,
         solana_storage_proto::convert::generated,
-        solana_transaction_status::{
-            ConfirmedBlock, RewardsAndNumPartitions, TransactionStatusMeta,
-        },
-        solana_transaction_v3::{
+        solana_transaction::{
             sanitized::{MessageHash, SanitizedTransaction},
             versioned::VersionedTransaction,
+        },
+        solana_transaction_status::{
+            ConfirmedBlock, RewardsAndNumPartitions, TransactionStatusMeta,
         },
         std::{collections::HashSet, fs},
     };
@@ -393,9 +393,7 @@ pub mod fixtures {
                 transaction: Some(SubscribeUpdateTransactionInfo {
                     signature: self.signature.as_ref().to_vec(),
                     is_vote: self.is_vote,
-                    transaction: Some(convert_to::create_status_transaction(
-                        &self.versioned_transaction,
-                    )),
+                    transaction: Some(convert_to::create_transaction(&self.versioned_transaction)),
                     meta: Some(convert_to::create_transaction_meta(
                         &self.transaction_status_meta,
                     )),

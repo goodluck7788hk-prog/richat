@@ -641,6 +641,7 @@ impl From<ConfigFilterAccounts> for SubscribeRequestFilterAccounts {
             owner: ConfigFilter::conv_vec_pubkeys(value.owner),
             filters: value.filters.into_iter().map(Into::into).collect(),
             nonempty_txn_signature: value.nonempty_txn_signature,
+            cuckoo_accounts_filter: None,
         }
     }
 }
@@ -884,6 +885,8 @@ impl From<ConfigFilterTransactions> for SubscribeRequestFilterTransactions {
             account_include: ConfigFilter::conv_vec_pubkeys(value.account_include),
             account_exclude: ConfigFilter::conv_vec_pubkeys(value.account_exclude),
             account_required: ConfigFilter::conv_vec_pubkeys(value.account_required),
+            cuckoo_account_include: None,
+            token_accounts: None,
         }
     }
 }
@@ -918,6 +921,7 @@ impl From<ConfigFilterBlocks> for SubscribeRequestFilterBlocks {
             include_transactions: value.include_transactions,
             include_accounts: value.include_accounts,
             include_entries: value.include_entries,
+            cuckoo_account_include: None,
         }
     }
 }

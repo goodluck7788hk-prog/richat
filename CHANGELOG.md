@@ -16,6 +16,8 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Breaking
 
+- richat: upgrade to agave 4.2, add support for V1 (SIMD-0385) transaction messages
+
 ## 2026-05-20
 
 - richat-cli-v10.0.0

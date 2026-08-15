@@ -25,7 +25,7 @@ solana-clock = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
-solana-transaction-status = { workspace = true }
+solana-transaction-status = { workspace = true, features = ["agave-unstable-api"] }
 spl-token-2022-interface = { workspace = true }
 thiserror = { workspace = true }
 
