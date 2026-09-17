@@ -10,7 +10,7 @@ use {
     solana_clock::Slot,
     solana_message::{
         MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
-        v0::MessageAddressTableLookup,
+        v0::MessageAddressTableLookup, v1::TransactionConfig,
     },
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_signature::{SIGNATURE_BYTES, Signature},
@@ -246,8 +246,26 @@ impl Message for VersionedMessageWrapper<'_> {
                     buf,
                 );
             }
-            VersionedMessage::V1(_) => {
-                unimplemented!("V1 transaction messages are not supported")
+            // V1 (SIMD-0385)：字段 1~4 与 V0 同构，但
+            //   · blockhash 在 V1 叫 lifetime_specifier
+            //   · V1 不支持地址查找表，字段 6 恒为空
+            //   · versioned 对 V0/V1 都是 true，下游只能靠字段 7 是否存在来区分
+            VersionedMessage::V1(message) => {
+                encoding::message::encode(1, &MessageHeaderWrapper(message.header), buf);
+                pubkeys_encode(2, &message.account_keys, buf);
+                bytes_encode(3, message.lifetime_specifier.as_ref(), buf);
+                encoding::message::encode_repeated(
+                    4,
+                    CompiledInstructionWrapper::new(&message.instructions),
+                    buf,
+                );
+                versioned_encode(5, true, buf);
+                encoding::message::encode_repeated(
+                    6,
+                    MessageAddressTableLookupWrapper::new(&[]),
+                    buf,
+                );
+                encoding::message::encode(7, &TransactionConfigWrapper(&message.config), buf);
             }
         }
     }
@@ -282,8 +300,23 @@ impl Message for VersionedMessageWrapper<'_> {
                         MessageAddressTableLookupWrapper::new(&message.address_table_lookups),
                     )
             }
-            VersionedMessage::V1(_) => {
-                unimplemented!("V1 transaction messages are not supported")
+            VersionedMessage::V1(message) => {
+                encoding::message::encoded_len(1, &MessageHeaderWrapper(message.header))
+                    + pubkeys_encoded_len(2, &message.account_keys)
+                    + bytes_encoded_len(3, message.lifetime_specifier.as_ref())
+                    + encoding::message::encoded_len_repeated(
+                        4,
+                        CompiledInstructionWrapper::new(&message.instructions),
+                    )
+                    + versioned_encoded_len(5, true)
+                    + encoding::message::encoded_len_repeated(
+                        6,
+                        MessageAddressTableLookupWrapper::new(&[]),
+                    )
+                    + encoding::message::encoded_len(
+                        7,
+                        &TransactionConfigWrapper(&message.config),
+                    )
             }
         }
     }
@@ -369,6 +402,68 @@ impl Message for MessageHeaderWrapper {
     where
         Self: Sized,
     {
+        unimplemented!()
+    }
+}
+
+// V1 (SIMD-0385) 把原先的 ComputeBudget 指令内联进消息体，对应 proto 的
+//   optional TransactionConfig config = 7;  // 仅 V1 设置，legacy/V0 不写
+// 四个字段都是 optional：Some 时必须编码（哪怕值为 0，optional 有 presence 语义），
+// None 时完全不写。这与上面 header 那种「值为 0 就省略」的 proto3 隐式默认值不同。
+#[repr(transparent)]
+struct TransactionConfigWrapper<'a>(&'a TransactionConfig);
+
+impl Message for TransactionConfigWrapper<'_> {
+    fn encode_raw(&self, buf: &mut impl BufMut)
+    where
+        Self: Sized,
+    {
+        if let Some(value) = self.0.priority_fee {
+            encoding::uint64::encode(1, &value, buf);
+        }
+        if let Some(value) = self.0.compute_unit_limit {
+            encoding::uint32::encode(2, &value, buf);
+        }
+        if let Some(value) = self.0.loaded_accounts_data_size_limit {
+            encoding::uint32::encode(3, &value, buf);
+        }
+        if let Some(value) = self.0.heap_size {
+            encoding::uint32::encode(4, &value, buf);
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.0
+            .priority_fee
+            .map_or(0, |value| encoding::uint64::encoded_len(1, &value))
+            + self
+                .0
+                .compute_unit_limit
+                .map_or(0, |value| encoding::uint32::encoded_len(2, &value))
+            + self
+                .0
+                .loaded_accounts_data_size_limit
+                .map_or(0, |value| encoding::uint32::encoded_len(3, &value))
+            + self
+                .0
+                .heap_size
+                .map_or(0, |value| encoding::uint32::encoded_len(4, &value))
+    }
+
+    fn merge_field(
+        &mut self,
+        _tag: u32,
+        _wire_type: WireType,
+        _buf: &mut impl Buf,
+        _ctx: DecodeContext,
+    ) -> Result<(), DecodeError>
+    where
+        Self: Sized,
+    {
+        unimplemented!()
+    }
+
+    fn clear(&mut self) {
         unimplemented!()
     }
 }
