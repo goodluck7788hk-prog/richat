@@ -48,6 +48,7 @@ pub fn create_status_transaction(tx: &StatusVersionedTransaction) -> proto::Tran
                 instructions: create_status_instructions(&message.instructions),
                 versioned: false,
                 address_table_lookups: vec![],
+                config: None,
             },
             StatusVersionedMessage::V0(message) => proto::Message {
                 header: Some(create_status_header(&message.header)),
@@ -56,10 +57,25 @@ pub fn create_status_transaction(tx: &StatusVersionedTransaction) -> proto::Tran
                 instructions: create_status_instructions(&message.instructions),
                 versioned: true,
                 address_table_lookups: create_status_lookups(&message.address_table_lookups),
+                config: None,
             },
-            StatusVersionedMessage::V1(_) => {
-                unimplemented!("V1 transaction messages are not supported")
-            }
+            StatusVersionedMessage::V1(message) => proto::Message {
+                header: Some(create_status_header(&message.header)),
+                account_keys: create_pubkeys(&message.account_keys),
+                // V1 的 blockhash 字段叫 lifetime_specifier
+                recent_blockhash: message.lifetime_specifier.to_bytes().into(),
+                instructions: create_status_instructions(&message.instructions),
+                // versioned 对 V0/V1 都是 true，下游靠 config 是否存在来区分
+                versioned: true,
+                // V1 不支持地址查找表
+                address_table_lookups: vec![],
+                config: Some(proto::TransactionConfig {
+                    priority_fee: message.config.priority_fee,
+                    compute_unit_limit: message.config.compute_unit_limit,
+                    loaded_accounts_data_size_limit: message.config.loaded_accounts_data_size_limit,
+                    heap_size: message.config.heap_size,
+                }),
+            },
         }),
     }
 }
@@ -73,6 +89,7 @@ pub fn create_message(message: &VersionedMessage) -> proto::Message {
             instructions: create_instructions(&message.instructions),
             versioned: false,
             address_table_lookups: vec![],
+            config: None,
         },
         VersionedMessage::V0(message) => proto::Message {
             header: Some(create_header(&message.header)),
@@ -81,8 +98,22 @@ pub fn create_message(message: &VersionedMessage) -> proto::Message {
             instructions: create_instructions(&message.instructions),
             versioned: true,
             address_table_lookups: create_lookups(&message.address_table_lookups),
+            config: None,
         },
-        VersionedMessage::V1(_) => unimplemented!("V1 transaction messages are not supported"),
+        VersionedMessage::V1(message) => proto::Message {
+            header: Some(create_header(&message.header)),
+            account_keys: create_pubkeys(&message.account_keys),
+            recent_blockhash: message.lifetime_specifier.to_bytes().into(),
+            instructions: create_instructions(&message.instructions),
+            versioned: true,
+            address_table_lookups: vec![],
+            config: Some(proto::TransactionConfig {
+                priority_fee: message.config.priority_fee,
+                compute_unit_limit: message.config.compute_unit_limit,
+                loaded_accounts_data_size_limit: message.config.loaded_accounts_data_size_limit,
+                heap_size: message.config.heap_size,
+            }),
+        },
     }
 }
 

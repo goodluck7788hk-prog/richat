@@ -532,6 +532,9 @@ impl ActionSubscribe {
                     account_include: self.transactions_account_include,
                     account_exclude: self.transactions_account_exclude,
                     account_required: self.transactions_account_required,
+                    // yellowstone-grpc-proto 12.7.0 新增：可选的 cuckoo filter 形式的 account_include
+                    // （用于超大地址集合的紧凑匹配）。我们走普通 account_include，置 None。
+                    cuckoo_account_include: None,
                     token_accounts: None,
                 },
             );
@@ -548,6 +551,9 @@ impl ActionSubscribe {
                     account_include: self.transactions_status_account_include,
                     account_exclude: self.transactions_status_account_exclude,
                     account_required: self.transactions_status_account_required,
+                    // yellowstone-grpc-proto 12.7.0 新增：可选的 cuckoo filter 形式的 account_include
+                    // （用于超大地址集合的紧凑匹配）。我们走普通 account_include，置 None。
+                    cuckoo_account_include: None,
                     token_accounts: None,
                 },
             );

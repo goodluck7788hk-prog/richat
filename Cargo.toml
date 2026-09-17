@@ -117,7 +117,7 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 vergen = "9.0.2"
 webpki-roots = "1.0.1"
-yellowstone-grpc-proto = "12.5.0"
+yellowstone-grpc-proto = "12.7.0"
 zstd = "0.13.3"
 
 [workspace.lints.clippy]

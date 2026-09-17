@@ -895,6 +895,9 @@ impl From<ConfigFilterTransactions> for SubscribeRequestFilterTransactions {
             account_include: ConfigFilter::conv_vec_pubkeys(value.account_include),
             account_exclude: ConfigFilter::conv_vec_pubkeys(value.account_exclude),
             account_required: ConfigFilter::conv_vec_pubkeys(value.account_required),
+            // yellowstone-grpc-proto 12.7.0 新增：可选的 cuckoo filter 形式的 account_include
+            // （用于超大地址集合的紧凑匹配）。我们走普通 account_include，置 None。
+            cuckoo_account_include: None,
             token_accounts: None,
         }
     }
