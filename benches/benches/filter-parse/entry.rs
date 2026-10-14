@@ -1,6 +1,6 @@
 use {
     criterion::Criterion,
-    richat_benches::fixtures::generate_entries,
+    richat_benches::fixtures::{BANK_ID, generate_entries},
     richat_filter::message::{Message, MessageParserEncoding},
     richat_plugin_agave::protobuf::{ProtobufEncoder, ProtobufMessage},
     std::{borrow::Cow, hint::black_box, time::SystemTime},
@@ -14,7 +14,10 @@ pub fn bench_parse_entries(criterion: &mut Criterion) {
         .iter()
         .map(|e| {
             let replica = e.to_replica();
-            let msg = ProtobufMessage::Entry { entry: &replica };
+            let msg = ProtobufMessage::Entry {
+                bank_id: BANK_ID,
+                entry: &replica,
+            };
             msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
         })
         .collect::<Vec<_>>();

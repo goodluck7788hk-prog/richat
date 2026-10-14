@@ -36,7 +36,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 solana-account-decoder = { workspace = true, features = ["agave-unstable-api"] }
+solana-bls-signatures = { workspace = true }
 solana-clock = { workspace = true }
+solana-entry = { workspace = true, features = ["agave-unstable-api"] }
 solana-logger = { workspace = true }
 solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
@@ -49,7 +51,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+agave-votor-messages = { workspace = true, features = ["agave-unstable-api"] }
 richat-benches = { workspace = true }
+solana-entry = { workspace = true, features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-hash = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

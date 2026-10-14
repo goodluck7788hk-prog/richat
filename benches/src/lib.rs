@@ -1,4 +1,6 @@
 pub mod fixtures {
+    pub const BANK_ID: u64 = 123_456_789; // multi-byte varint
+
     use {
         agave_geyser_plugin_interface::geyser_plugin_interface::{
             ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaEntryInfoV2, ReplicaTransactionInfoV3,
@@ -84,6 +86,7 @@ pub mod fixtures {
 
         pub fn to_prost(&self) -> SubscribeUpdateAccount {
             SubscribeUpdateAccount {
+                bank_id: Some(BANK_ID),
                 account: Some(SubscribeUpdateAccountInfo {
                     pubkey: self.pubkey.as_ref().to_vec(),
                     lamports: self.lamports,
@@ -196,6 +199,7 @@ pub mod fixtures {
 
         pub fn to_prost(&self) -> SubscribeUpdateBlockMeta {
             SubscribeUpdateBlockMeta {
+                bank_id: BANK_ID,
                 slot: self.slot,
                 blockhash: self.block.blockhash.clone(),
                 rewards: Some(convert_to::create_rewards_obj(
@@ -263,6 +267,7 @@ pub mod fixtures {
 
         pub fn to_prost(&self) -> SubscribeUpdateEntry {
             SubscribeUpdateEntry {
+                bank_id: BANK_ID,
                 slot: self.slot,
                 index: self.index as u64,
                 num_hashes: self.num_hashes,
@@ -319,6 +324,7 @@ pub mod fixtures {
 
         pub fn to_prost(&self) -> SubscribeUpdateSlot {
             SubscribeUpdateSlot {
+                bank_id: Some(BANK_ID),
                 slot: self.slot,
                 parent: self.parent,
                 status: match &self.status {
@@ -390,6 +396,7 @@ pub mod fixtures {
 
         pub fn to_prost(&self) -> SubscribeUpdateTransaction {
             SubscribeUpdateTransaction {
+                bank_id: BANK_ID,
                 transaction: Some(SubscribeUpdateTransactionInfo {
                     signature: self.signature.as_ref().to_vec(),
                     is_vote: self.is_vote,

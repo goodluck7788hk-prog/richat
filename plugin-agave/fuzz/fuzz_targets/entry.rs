@@ -13,10 +13,12 @@ pub struct FuzzEntry {
     pub hash: Vec<u8>,
     pub executed_transaction_count: u64,
     pub starting_transaction_index: usize,
+    pub bank_id: u64,
 }
 
 libfuzzer_sys::fuzz_target!(|fuzz_entry: FuzzEntry| {
     let message = ProtobufMessage::Entry {
+        bank_id: fuzz_entry.bank_id,
         entry: &ReplicaEntryInfoV2 {
             slot: fuzz_entry.slot,
             index: fuzz_entry.index,

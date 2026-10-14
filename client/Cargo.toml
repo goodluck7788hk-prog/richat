@@ -29,12 +29,15 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tonic = { workspace = true, features = ["tls-native-roots"] }
 tonic-prost = { workspace = true }
-tracing = { workspace = true }
 webpki-roots = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
 tonic-build = { workspace = true }
+
+[package.metadata.cargo-machete]
+# used via `#[serde(with = "humantime_serde")]` and build.rs `codec_path`
+ignored = ["humantime-serde", "tonic-prost"]
 
 [lints]
 workspace = true

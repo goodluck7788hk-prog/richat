@@ -1,6 +1,6 @@
 use {
     criterion::Criterion,
-    richat_benches::fixtures::generate_accounts,
+    richat_benches::fixtures::{BANK_ID, generate_accounts},
     richat_plugin_agave::protobuf::{ProtobufEncoder, ProtobufMessage},
     std::{hint::black_box, time::SystemTime},
 };
@@ -22,6 +22,7 @@ pub fn bench_encode_accounts(criterion: &mut Criterion) {
                 black_box({
                     for (slot, account) in accounts {
                         let message = ProtobufMessage::Account {
+                            bank_id: Some(BANK_ID),
                             slot: *slot,
                             account,
                         };
@@ -37,6 +38,7 @@ pub fn bench_encode_accounts(criterion: &mut Criterion) {
                 black_box({
                     for (slot, account) in accounts {
                         let message = ProtobufMessage::Account {
+                            bank_id: Some(BANK_ID),
                             slot: *slot,
                             account,
                         };

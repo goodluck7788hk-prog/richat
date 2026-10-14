@@ -36,10 +36,12 @@ pub struct FuzzSlot {
     slot: u64,
     parent: Option<u64>,
     status: FuzzSlotStatus,
+    bank_id: Option<u64>,
 }
 
 libfuzzer_sys::fuzz_target!(|fuzz_slot: FuzzSlot| {
     let message = ProtobufMessage::Slot {
+        bank_id: fuzz_slot.bank_id,
         slot: fuzz_slot.slot,
         parent: fuzz_slot.parent,
         status: &fuzz_slot.status.into(),

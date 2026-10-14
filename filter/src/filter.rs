@@ -2,13 +2,14 @@ use {
     crate::{
         config::{
             ConfigFilter, ConfigFilterAccounts, ConfigFilterAccountsDataSlice,
-            ConfigFilterAccountsFilter, ConfigFilterAccountsFilterLamports, ConfigFilterBlocks,
-            ConfigFilterCommitment, ConfigFilterSlots, ConfigFilterTransactions, MAX_DATA_SIZE,
-            MAX_FILTERS,
+            ConfigFilterAccountsFilter, ConfigFilterAccountsFilterLamports,
+            ConfigFilterBlockFooter, ConfigFilterBlocks, ConfigFilterCommitment, ConfigFilterSlots,
+            ConfigFilterTransactions, MAX_DATA_SIZE, MAX_FILTERS,
         },
         message::{
-            Message, MessageAccount, MessageBlock, MessageBlockCreatedAt, MessageBlockMeta,
-            MessageEntry, MessageRef, MessageSlot, MessageTransaction,
+            Message, MessageAccount, MessageBlock, MessageBlockCreatedAt, MessageBlockFooter,
+            MessageBlockMeta, MessageEntry, MessageEntryUpdateParent, MessageRef, MessageSlot,
+            MessageTransaction,
         },
         protobuf::encode::{
             SubscribeUpdateMessageLimited, SubscribeUpdateMessageProst, UpdateOneofLimitedEncode,
@@ -82,8 +83,10 @@ pub struct Filter {
     transactions: FilterTransactions,
     transactions_status: FilterTransactions,
     entries: FilterEntries,
+    entries_update_parent: FilterEntries,
     blocks_meta: FilterBlocksMeta,
     blocks: FilterBlocks,
+    block_footer: FilterBlockFooter,
     commitment: ConfigFilterCommitment,
 }
 
@@ -102,8 +105,10 @@ impl Default for Filter {
                 filters: HashMap::default(),
             },
             entries: FilterEntries::default(),
+            entries_update_parent: FilterEntries::default(),
             blocks_meta: FilterBlocksMeta::default(),
             blocks: FilterBlocks::default(),
+            block_footer: FilterBlockFooter::default(),
             commitment: ConfigFilterCommitment::default(),
         }
     }
@@ -127,8 +132,10 @@ impl Filter {
                 FilterTransactionsType::TransactionStatus,
             ),
             entries: FilterEntries::new(&mut names, &config.entries),
+            entries_update_parent: FilterEntries::new(&mut names, &config.entries_update_parent),
             blocks_meta: FilterBlocksMeta::new(&mut names, &config.blocks_meta),
             blocks: FilterBlocks::new(&mut names, &config.blocks),
+            block_footer: FilterBlockFooter::new(&mut names, &config.block_footer),
             commitment: config
                 .commitment
                 .unwrap_or(ConfigFilterCommitment::Processed),
@@ -192,6 +199,23 @@ impl Filter {
             MessageRef::Block(message) => {
                 for update in self.blocks.get_updates(message, &self.accounts_data_slices) {
                     vec.push(update);
+                }
+            }
+            MessageRef::BlockFooter(message) => {
+                vec.extend(self.block_footer.get_updates(message));
+            }
+            MessageRef::EntryUpdateParent(message) => {
+                let filters = self
+                    .entries_update_parent
+                    .filters
+                    .iter()
+                    .map(|f| f.as_ref())
+                    .collect::<FilteredUpdateFilters>();
+                if !filters.is_empty() {
+                    vec.push(FilteredUpdate {
+                        filters,
+                        filtered_update: FilteredUpdateType::EntryUpdateParent { message },
+                    });
                 }
             }
         }
@@ -625,6 +649,54 @@ impl FilterEntries {
 }
 
 #[derive(Debug, Default, Clone)]
+struct FilterBlockFooter {
+    /// name -> include_certificates
+    filters: HashMap<FilterName, bool>,
+}
+
+impl FilterBlockFooter {
+    fn new(names: &mut FilterNames, configs: &HashMap<String, ConfigFilterBlockFooter>) -> Self {
+        Self {
+            filters: configs
+                .iter()
+                .map(|(name, filter)| {
+                    (
+                        names.get(name),
+                        filter.include_certificates.unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Up to two updates: one for filters with certificates and one for filters without.
+    fn get_updates<'a>(
+        &'a self,
+        message: &'a MessageBlockFooter,
+    ) -> SmallVec<[FilteredUpdate<'a>; 2]> {
+        let mut updates = SmallVec::new();
+        for include_certificates in [true, false] {
+            let filters = self
+                .filters
+                .iter()
+                .filter(|(_, include)| **include == include_certificates)
+                .map(|(name, _)| name.as_ref())
+                .collect::<FilteredUpdateFilters>();
+            if !filters.is_empty() {
+                updates.push(FilteredUpdate {
+                    filters,
+                    filtered_update: FilteredUpdateType::BlockFooter {
+                        message,
+                        include_certificates,
+                    },
+                });
+            }
+        }
+        updates
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 struct FilterBlocksMeta {
     filters: Vec<FilterName>,
 }
@@ -776,6 +848,7 @@ impl FilteredUpdate<'_> {
                     parent,
                     status,
                     dead_error,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageProst {
@@ -785,6 +858,7 @@ impl FilteredUpdate<'_> {
                         parent: *parent,
                         status: *status as i32,
                         dead_error: dead_error.clone(),
+                        bank_id: *bank_id,
                     }),
                     created_at: *created_at,
                 }
@@ -805,6 +879,7 @@ impl FilteredUpdate<'_> {
                     write_version,
                     slot,
                     is_startup,
+                    bank_id,
                     created_at,
                     buffer,
                     account_offset: _,
@@ -834,6 +909,7 @@ impl FilteredUpdate<'_> {
                             },
                             slot: *slot,
                             is_startup: *is_startup,
+                            bank_id: *bank_id,
                         }
                     }),
                     created_at: *created_at,
@@ -843,6 +919,7 @@ impl FilteredUpdate<'_> {
                     account,
                     slot,
                     is_startup,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageProst {
@@ -860,6 +937,7 @@ impl FilteredUpdate<'_> {
                         }),
                         slot: *slot,
                         is_startup: *is_startup,
+                        bank_id: *bank_id,
                     }),
                     created_at: *created_at,
                 }
@@ -882,6 +960,7 @@ impl FilteredUpdate<'_> {
                 MessageTransaction::Prost {
                     transaction,
                     slot,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageProst {
@@ -889,6 +968,7 @@ impl FilteredUpdate<'_> {
                     update: UpdateOneof::Transaction(SubscribeUpdateTransaction {
                         transaction: Some(transaction.clone()),
                         slot: *slot,
+                        bank_id: *bank_id,
                     }),
                     created_at: *created_at,
                 }
@@ -900,6 +980,7 @@ impl FilteredUpdate<'_> {
                     is_vote,
                     index,
                     slot,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageLimited {
@@ -911,6 +992,7 @@ impl FilteredUpdate<'_> {
                             is_vote: *is_vote,
                             index: *index,
                             err: error.clone(),
+                            bank_id: *bank_id,
                         },
                     ),
                     created_at: *created_at,
@@ -920,6 +1002,7 @@ impl FilteredUpdate<'_> {
                     error,
                     transaction,
                     slot,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageProst {
@@ -930,6 +1013,7 @@ impl FilteredUpdate<'_> {
                         is_vote: transaction.is_vote,
                         index: transaction.index,
                         err: error.clone(),
+                        bank_id: *bank_id,
                     }),
                     created_at: *created_at,
                 }
@@ -958,6 +1042,29 @@ impl FilteredUpdate<'_> {
                 }
                 .encode(buf),
             },
+            FilteredUpdateType::BlockFooter {
+                message,
+                include_certificates,
+            } => {
+                let mut footer = message.footer().clone();
+                if !include_certificates {
+                    footer.block_final_cert = None;
+                    footer.skip_reward_cert = None;
+                    footer.notar_reward_cert = None;
+                }
+                SubscribeUpdateMessageProst {
+                    filters: &self.filters,
+                    update: UpdateOneof::BlockFooter(footer),
+                    created_at: message.created_at().into(),
+                }
+                .encode(buf)
+            }
+            FilteredUpdateType::EntryUpdateParent { message } => SubscribeUpdateMessageProst {
+                filters: &self.filters,
+                update: UpdateOneof::EntryUpdateParent(message.update_parent().clone()),
+                created_at: message.created_at().into(),
+            }
+            .encode(buf),
             FilteredUpdateType::BlockMeta { message } => match message {
                 MessageBlockMeta::Limited {
                     created_at,
@@ -1007,6 +1114,7 @@ impl FilteredUpdate<'_> {
                             parent_slot: block_meta.parent_slot,
                             parent_blockhash: block_meta.parent_blockhash.as_str(),
                             executed_transaction_count: block_meta.executed_transaction_count,
+                            bank_id: block_meta.bank_id,
                             transactions: transactions
                                 .iter()
                                 .map(|idx| match message.transactions[*idx].as_ref() {
@@ -1088,6 +1196,7 @@ impl FilteredUpdate<'_> {
                             block_height: block_meta.block_height,
                             parent_slot: block_meta.parent_slot,
                             parent_blockhash: block_meta.parent_blockhash.clone(),
+                            bank_id: block_meta.bank_id,
                             executed_transaction_count: block_meta.executed_transaction_count,
                             transactions: transactions
                                 .iter()
@@ -1164,6 +1273,13 @@ pub enum FilteredUpdateType<'a> {
     BlockMeta {
         message: &'a MessageBlockMeta,
     },
+    BlockFooter {
+        message: &'a MessageBlockFooter,
+        include_certificates: bool,
+    },
+    EntryUpdateParent {
+        message: &'a MessageEntryUpdateParent,
+    },
     Block {
         message: &'a MessageBlock,
         accounts: Vec<usize>,
@@ -1184,6 +1300,11 @@ impl<'a> From<MessageRef<'a>> for FilteredUpdateType<'a> {
             MessageRef::Transaction(message) => Self::Transaction { message },
             MessageRef::Entry(message) => Self::Entry { message },
             MessageRef::BlockMeta(message) => Self::BlockMeta { message },
+            MessageRef::BlockFooter(message) => Self::BlockFooter {
+                message,
+                include_certificates: true,
+            },
+            MessageRef::EntryUpdateParent(message) => Self::EntryUpdateParent { message },
             MessageRef::Block(message) => Self::Block {
                 message,
                 accounts: (0..message.accounts.len()).collect(),

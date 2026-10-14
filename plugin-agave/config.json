@@ -10,6 +10,9 @@
     "worker_threads": null, // by default number of cpus
     "affinity": null // by default no affinity (taskset syntax)
   },
+  // Alpenglow messages, disabled by default (consumers must understand them)
+  "block_footer": false,
+  "entry_update_parent": false,
   "channel": {
     "encoder": "raw",
     "max_messages": "2_097_152",

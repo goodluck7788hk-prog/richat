@@ -409,6 +409,7 @@ impl Subscription {
             accounts_data_slice: vec![],
             ping: None,
             from_slot,
+            block_footer: HashMap::new(),
         }
     }
 }

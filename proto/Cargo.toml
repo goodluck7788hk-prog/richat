@@ -32,5 +32,9 @@ cargo-lock = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 tonic-prost-build = { workspace = true }
 
+[package.metadata.cargo-machete]
+# used by generated `richat.rs` (`include!` from OUT_DIR)
+ignored = ["prost"]
+
 [lints]
 workspace = true

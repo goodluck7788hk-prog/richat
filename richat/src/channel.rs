@@ -9,8 +9,9 @@ use {
     richat_filter::{
         filter::FilteredUpdate,
         message::{
-            Message, MessageAccount, MessageBlock, MessageBlockMeta, MessageEntry,
-            MessageParserEncoding, MessageRef, MessageSlot, MessageTransaction,
+            Message, MessageAccount, MessageBlock, MessageBlockFooter, MessageBlockMeta,
+            MessageEntry, MessageEntryUpdateParent, MessageParserEncoding, MessageRef, MessageSlot,
+            MessageTransaction,
         },
     },
     richat_proto::{geyser::SlotStatus, richat::RichatFilter},
@@ -100,6 +101,8 @@ pub enum ParsedMessage {
     Entry(Arc<MessageEntry>),
     BlockMeta(Arc<MessageBlockMeta>),
     Block(Arc<MessageBlock>),
+    BlockFooter(Arc<MessageBlockFooter>),
+    EntryUpdateParent(Arc<MessageEntryUpdateParent>),
 }
 
 impl From<Message> for ParsedMessage {
@@ -111,6 +114,8 @@ impl From<Message> for ParsedMessage {
             Message::Entry(msg) => Self::Entry(Arc::new(msg)),
             Message::BlockMeta(msg) => Self::BlockMeta(Arc::new(msg)),
             Message::Block(msg) => Self::Block(Arc::new(msg)),
+            Message::BlockFooter(msg) => Self::BlockFooter(Arc::new(msg)),
+            Message::EntryUpdateParent(msg) => Self::EntryUpdateParent(Arc::new(msg)),
         }
     }
 }
@@ -124,6 +129,8 @@ impl<'a> From<&'a ParsedMessage> for MessageRef<'a> {
             ParsedMessage::Entry(msg) => Self::Entry(msg.as_ref()),
             ParsedMessage::BlockMeta(msg) => Self::BlockMeta(msg.as_ref()),
             ParsedMessage::Block(msg) => Self::Block(msg.as_ref()),
+            ParsedMessage::BlockFooter(msg) => Self::BlockFooter(msg.as_ref()),
+            ParsedMessage::EntryUpdateParent(msg) => Self::EntryUpdateParent(msg.as_ref()),
         }
     }
 }
@@ -137,6 +144,8 @@ impl ParsedMessage {
             Self::Entry(_msg) => "entry",
             Self::BlockMeta(_msg) => "blockmeta",
             Self::Block(_msg) => "block",
+            Self::BlockFooter(_msg) => "blockfooter",
+            Self::EntryUpdateParent(_msg) => "entryupdateparent",
         }
     }
 
@@ -148,6 +157,8 @@ impl ParsedMessage {
             Self::Entry(msg) => msg.slot(),
             Self::BlockMeta(msg) => msg.slot(),
             Self::Block(msg) => msg.slot(),
+            Self::BlockFooter(msg) => msg.slot(),
+            Self::EntryUpdateParent(msg) => msg.slot(),
         }
     }
 
@@ -159,6 +170,8 @@ impl ParsedMessage {
             Self::Entry(msg) => msg.size(),
             Self::BlockMeta(msg) => msg.size(),
             Self::Block(msg) => msg.size(),
+            Self::BlockFooter(msg) => msg.size(),
+            Self::EntryUpdateParent(msg) => msg.size(),
         }
     }
 
@@ -219,6 +232,16 @@ impl ParsedMessage {
             ParsedMessage::Block(msg) => {
                 state.write_u8(5);
                 state.write_u64(msg.slot());
+            }
+            ParsedMessage::BlockFooter(msg) => {
+                state.write_u8(6);
+                state.write_u64(msg.slot());
+                state.write_u64(msg.bank_id());
+            }
+            ParsedMessage::EntryUpdateParent(msg) => {
+                state.write_u8(7);
+                state.write_u64(msg.slot());
+                state.write_u64(msg.cleared_bank_id());
             }
         }
         state.finish()
@@ -609,6 +632,16 @@ impl Sender {
                         messages.push(ParsedMessage::BlockMeta(Arc::new(msg)));
                     }
                 }
+                Message::BlockFooter(msg) => {
+                    if dedup.block_footers.insert(msg.bank_id()) {
+                        messages.push(ParsedMessage::BlockFooter(Arc::new(msg)));
+                    }
+                }
+                Message::EntryUpdateParent(msg) => {
+                    if dedup.entry_update_parents.insert(msg.cleared_bank_id()) {
+                        messages.push(ParsedMessage::EntryUpdateParent(Arc::new(msg)));
+                    }
+                }
                 Message::Block(_) => unreachable!(),
             };
         } else {
@@ -890,7 +923,11 @@ impl ReceiverAsync {
                 ParsedMessage::Transaction(_) if !self.enable_notifications_transactions => {
                     continue;
                 }
-                ParsedMessage::Entry(_) if !self.enable_notifications_entries => continue,
+                ParsedMessage::Entry(_) | ParsedMessage::EntryUpdateParent(_)
+                    if !self.enable_notifications_entries =>
+                {
+                    continue;
+                }
                 ParsedMessage::Block(_) => continue,
                 _ => {}
             }
@@ -1172,6 +1209,16 @@ impl SlotInfo {
     }
 
     fn get_block_message(&mut self, message: &ParsedMessage) -> Option<ParsedMessage> {
+        // footers and entry parent updates are not part of the block message,
+        // but must be replayed to confirmed / finalized receivers
+        if matches!(
+            message,
+            ParsedMessage::BlockFooter(_) | ParsedMessage::EntryUpdateParent(_)
+        ) {
+            self.messages.push(Some(message.clone()));
+            return None;
+        }
+
         // mark as landed
         if let ParsedMessage::Slot(message) = message
             && matches!(
@@ -1201,7 +1248,9 @@ impl SlotInfo {
                     ParsedMessage::BlockMeta(_) => {
                         reasons.push(metrics::BlockMessageFailedReason::ExtraBlockMeta);
                     }
-                    ParsedMessage::Block(_) => {}
+                    ParsedMessage::Block(_)
+                    | ParsedMessage::BlockFooter(_)
+                    | ParsedMessage::EntryUpdateParent(_) => {}
                 }
                 metrics::block_message_failed_inc(self.slot, &reasons);
             }
@@ -1243,7 +1292,9 @@ impl SlotInfo {
                 self.messages.push(Some(item));
                 self.block_meta = Some(Arc::clone(message));
             }
-            ParsedMessage::Block(_message) => unreachable!(),
+            ParsedMessage::Block(_)
+            | ParsedMessage::BlockFooter(_)
+            | ParsedMessage::EntryUpdateParent(_) => unreachable!(),
         }
 
         //  attempt to create Block
@@ -1333,6 +1384,8 @@ struct DedupInfo {
     transactions: HashMap<Signature, DedupInfoTransactionIndex, RandomState>,
     entries: Vec<bool>,
     block_meta: bool,
+    block_footers: HashSet<u64>,
+    entry_update_parents: HashSet<u64>,
 }
 
 impl Default for DedupInfo {
@@ -1344,6 +1397,8 @@ impl Default for DedupInfo {
             transactions: HashMap::with_capacity_and_hasher(8_192, RandomState::default()),
             entries: std::iter::repeat_n(false, 256).collect(),
             block_meta: false,
+            block_footers: HashSet::new(),
+            entry_update_parents: HashSet::new(),
         }
     }
 }

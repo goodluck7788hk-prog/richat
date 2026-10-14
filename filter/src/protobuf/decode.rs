@@ -98,7 +98,7 @@ impl LimitedDecode for SubscribeUpdateLimitedDecode {
                 Ok(())
             }
             #[allow(clippy::manual_range_patterns)]
-            2u32 | 3u32 | 4u32 | 10u32 | 5u32 | 6u32 | 9u32 | 7u32 | 8u32 => {
+            2u32 | 3u32 | 4u32 | 10u32 | 5u32 | 6u32 | 9u32 | 7u32 | 8u32 | 12u32 | 13u32 => {
                 let value = &mut self.update_oneof;
                 UpdateOneofLimitedDecode::merge(value, tag, buf, buf_len).map_err(|mut error| {
                     error.push(STRUCT_NAME, "update_oneof");
@@ -139,6 +139,8 @@ pub enum UpdateOneofLimitedDecode {
     Pong(Range<usize>),
     BlockMeta(Range<usize>),
     Entry(Range<usize>),
+    BlockFooter(Range<usize>),
+    EntryUpdateParent(Range<usize>),
 }
 
 impl UpdateOneofLimitedDecode {
@@ -224,6 +226,22 @@ impl UpdateOneofLimitedDecode {
                     Ok(())
                 }
             },
+            12u32 => match field {
+                Some(Self::BlockFooter(_)) => Err(create_decode_error("merge is not supported")),
+                _ => {
+                    *field = Some(Self::BlockFooter(range));
+                    Ok(())
+                }
+            },
+            13u32 => match field {
+                Some(Self::EntryUpdateParent(_)) => {
+                    Err(create_decode_error("merge is not supported"))
+                }
+                _ => {
+                    *field = Some(Self::EntryUpdateParent(range));
+                    Ok(())
+                }
+            },
             _ => unreachable!(),
         }
     }
@@ -242,6 +260,7 @@ pub struct UpdateOneofLimitedDecodeAccount {
     pub write_version: usize,
     pub slot: Slot,
     pub is_startup: bool,
+    pub bank_id: Option<u64>,
 }
 
 impl Default for UpdateOneofLimitedDecodeAccount {
@@ -258,6 +277,7 @@ impl Default for UpdateOneofLimitedDecodeAccount {
             write_version: usize::default(),
             slot: Slot::default(),
             is_startup: bool::default(),
+            bank_id: None,
         }
     }
 }
@@ -292,6 +312,13 @@ impl LimitedDecode for UpdateOneofLimitedDecodeAccount {
                 let value = &mut self.is_startup;
                 encoding::bool::merge(wire_type, value, buf, ctx).map_err(|mut error| {
                     error.push(STRUCT_NAME, "is_startup");
+                    error
+                })
+            }
+            4u32 => {
+                let value = self.bank_id.get_or_insert_default();
+                encoding::uint64::merge(wire_type, value, buf, ctx).map_err(|mut error| {
+                    error.push(STRUCT_NAME, "bank_id");
                     error
                 })
             }
@@ -475,6 +502,7 @@ impl LimitedDecode for UpdateOneofLimitedDecodeSlot {
 pub struct UpdateOneofLimitedDecodeTransaction {
     pub transaction: Option<Range<usize>>,
     pub slot: Slot,
+    pub bank_id: u64,
 }
 
 impl LimitedDecode for UpdateOneofLimitedDecodeTransaction {
@@ -508,6 +536,13 @@ impl LimitedDecode for UpdateOneofLimitedDecodeTransaction {
                 let value = &mut self.slot;
                 encoding::uint64::merge(wire_type, value, buf, ctx).map_err(|mut error| {
                     error.push(STRUCT_NAME, "slot");
+                    error
+                })
+            }
+            3u32 => {
+                let value = &mut self.bank_id;
+                encoding::uint64::merge(wire_type, value, buf, ctx).map_err(|mut error| {
+                    error.push(STRUCT_NAME, "bank_id");
                     error
                 })
             }

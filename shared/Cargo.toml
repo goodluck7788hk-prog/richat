@@ -38,7 +38,6 @@ rustls-pemfile = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
-socket2 = { workspace = true, optional = true }
 solana-clock = { workspace = true, optional = true }
 solana-pubkey = { workspace = true, optional = true }
 solana-rpc-client-api = { workspace = true, optional = true }
@@ -119,7 +118,6 @@ transports = [
     "dep:protoc-bin-vendored",
     "dep:quinn",
     "dep:richat-proto",
-    "dep:socket2",
     "dep:tonic",
     "dep:tonic-build",
     "dep:tracing",
@@ -127,6 +125,10 @@ transports = [
     "version",
 ]
 version = ["dep:hostname", "dep:serde", "dep:serde_json"]
+
+[package.metadata.cargo-machete]
+# used via `#[serde(with = "humantime_serde")]` and build.rs `codec_path`
+ignored = ["humantime-serde", "tonic-prost"]
 
 [lints]
 workspace = true

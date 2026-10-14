@@ -1,6 +1,6 @@
 use {
     criterion::Criterion,
-    richat_benches::fixtures::generate_block_metas,
+    richat_benches::fixtures::{BANK_ID, generate_block_metas},
     richat_filter::message::{Message, MessageParserEncoding},
     richat_plugin_agave::protobuf::{ProtobufEncoder, ProtobufMessage},
     std::{borrow::Cow, hint::black_box, time::SystemTime},
@@ -15,6 +15,7 @@ pub fn bench_parse_block_metas(criterion: &mut Criterion) {
         .map(|b| {
             let replica = b.to_replica();
             let msg = ProtobufMessage::BlockMeta {
+                bank_id: BANK_ID,
                 blockinfo: &replica,
             };
             msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)

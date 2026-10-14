@@ -4,8 +4,9 @@ use {
         CommitmentLevel as CommitmentLevelProto, SubscribeRequest,
         SubscribeRequestAccountsDataSlice, SubscribeRequestFilterAccounts,
         SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterLamports,
-        SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterBlocks,
-        SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
+        SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterBlockFooter,
+        SubscribeRequestFilterBlocks, SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
+        SubscribeRequestFilterTransactions,
         subscribe_request_filter_accounts_filter::Filter as AccountsFilterDataOneof,
         subscribe_request_filter_accounts_filter_lamports::Cmp as AccountsFilterLamports,
         subscribe_request_filter_accounts_filter_memcmp::Data as AccountsFilterMemcmpOneof,
@@ -153,6 +154,7 @@ impl ConfigLimits {
         self.blocks_meta
             .check_filter(self.name_max, &filter.blocks_meta)?;
         self.blocks.check_filter(self.name_max, &filter.blocks)?;
+        Self::check_names_max(filter.block_footer.keys(), self.name_max)?;
 
         Ok(())
     }
@@ -481,8 +483,11 @@ pub struct ConfigFilter {
     pub transactions: HashMap<String, ConfigFilterTransactions>,
     pub transactions_status: HashMap<String, ConfigFilterTransactions>,
     pub entries: HashSet<String>,
+    /// Entry filters (subset of `entries`) that also receive `EntryUpdateParent` updates
+    pub entries_update_parent: HashSet<String>,
     pub blocks_meta: HashSet<String>,
     pub blocks: HashMap<String, ConfigFilterBlocks>,
+    pub block_footer: HashMap<String, ConfigFilterBlockFooter>,
     pub commitment: Option<ConfigFilterCommitment>,
 }
 
@@ -540,9 +545,20 @@ impl TryFrom<SubscribeRequest> for ConfigFilter {
                 .collect::<Result<_, _>>()?,
             transactions: Self::try_conv_map(value.transactions)?,
             transactions_status: Self::try_conv_map(value.transactions_status)?,
+            entries_update_parent: value
+                .entry
+                .iter()
+                .filter(|(_, filter)| filter.include_update_parent == Some(true))
+                .map(|(name, _)| name.clone())
+                .collect(),
             entries: value.entry.into_keys().collect(),
             blocks_meta: value.blocks_meta.into_keys().collect(),
             blocks: Self::try_conv_map(value.blocks)?,
+            block_footer: value
+                .block_footer
+                .into_iter()
+                .map(|(name, filter)| (name, filter.into()))
+                .collect(),
             commitment: value.commitment.map(|value| value.try_into()).transpose()?,
         })
     }
@@ -560,12 +576,26 @@ impl From<ConfigFilter> for SubscribeRequest {
                 .collect(),
             transactions: ConfigFilter::conv_map(value.transactions),
             transactions_status: ConfigFilter::conv_map(value.transactions_status),
-            entry: ConfigFilter::conv_set(value.entries),
+            entry: value
+                .entries
+                .into_iter()
+                .map(|name| {
+                    let include_update_parent =
+                        value.entries_update_parent.contains(&name).then_some(true);
+                    (
+                        name,
+                        SubscribeRequestFilterEntry {
+                            include_update_parent,
+                        },
+                    )
+                })
+                .collect(),
             blocks_meta: ConfigFilter::conv_set(value.blocks_meta),
             blocks: ConfigFilter::conv_map(value.blocks),
             commitment: value.commitment.map(|c| c.into()),
             ping: None,
             from_slot: None,
+            block_footer: ConfigFilter::conv_map(value.block_footer),
         }
     }
 }
@@ -887,6 +917,28 @@ impl From<ConfigFilterTransactions> for SubscribeRequestFilterTransactions {
             account_required: ConfigFilter::conv_vec_pubkeys(value.account_required),
             cuckoo_account_include: None,
             token_accounts: None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigFilterBlockFooter {
+    pub include_certificates: Option<bool>,
+}
+
+impl From<SubscribeRequestFilterBlockFooter> for ConfigFilterBlockFooter {
+    fn from(value: SubscribeRequestFilterBlockFooter) -> Self {
+        Self {
+            include_certificates: value.include_certificates,
+        }
+    }
+}
+
+impl From<ConfigFilterBlockFooter> for SubscribeRequestFilterBlockFooter {
+    fn from(value: ConfigFilterBlockFooter) -> Self {
+        Self {
+            include_certificates: value.include_certificates,
         }
     }
 }

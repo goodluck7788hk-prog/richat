@@ -25,6 +25,10 @@ pub struct Config {
     pub channel: ConfigChannel,
     pub quic: Option<ConfigQuicServer>,
     pub grpc: Option<ConfigGrpcServer>,
+    /// Emit Alpenglow block footers (disabled by default, not understood by older consumers)
+    pub block_footer: bool,
+    /// Emit Alpenglow entry update parent markers (disabled by default, not understood by older consumers)
+    pub entry_update_parent: bool,
 }
 
 impl Config {

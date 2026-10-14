@@ -75,5 +75,9 @@ git-version = { workspace = true }
 tonic-build = { workspace = true }
 vergen = { workspace = true, features = ["build", "rustc"] }
 
+[package.metadata.cargo-machete]
+# used via `#[serde(with = "humantime_serde")]` and build.rs `codec_path`
+ignored = ["humantime-serde", "tonic-prost"]
+
 [lints]
 workspace = true

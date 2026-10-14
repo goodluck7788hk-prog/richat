@@ -28,6 +28,7 @@ pub struct FuzzAccount<'a> {
 pub struct FuzzAccountMessage<'a> {
     slot: u64,
     account: FuzzAccount<'a>,
+    bank_id: Option<u64>,
 }
 
 libfuzzer_sys::fuzz_target!(|fuzz_message: FuzzAccountMessage| {
@@ -54,6 +55,7 @@ libfuzzer_sys::fuzz_target!(|fuzz_message: FuzzAccountMessage| {
     });
 
     let message = ProtobufMessage::Account {
+        bank_id: fuzz_message.bank_id,
         account: &ReplicaAccountInfoV3 {
             pubkey: &fuzz_message.account.pubkey,
             lamports: fuzz_message.account.lamports,

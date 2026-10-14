@@ -247,11 +247,12 @@ impl ConfigYellowstoneGrpc {
             transactions_status: HashMap::new(),
             blocks: HashMap::new(),
             blocks_meta: hashmap! { "".to_owned() => SubscribeRequestFilterBlocksMeta {} },
-            entry: hashmap! { "".to_owned() => SubscribeRequestFilterEntry {} },
+            entry: hashmap! { "".to_owned() => SubscribeRequestFilterEntry::default() },
             commitment: Some(CommitmentLevel::Processed as i32),
             accounts_data_slice: vec![],
             ping: None,
             from_slot: None,
+            block_footer: HashMap::new(),
         };
 
         let mut client = GrpcClient::build_from_shared(self.endpoint)?
@@ -293,6 +294,7 @@ impl ConfigTrack {
                         Some(SubscribeUpdateTransactionInfo {
                             index: tx_index, ..
                         }),
+                    ..
                 }),
             ) if index == tx_index => Some(*slot),
             _ => None,

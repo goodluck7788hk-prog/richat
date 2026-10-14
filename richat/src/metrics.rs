@@ -230,6 +230,8 @@ pub enum GrpcSubscribeMessage {
     Entry,
     BlockMeta,
     Block,
+    BlockFooter,
+    EntryUpdateParent,
     Ping,
     Pong,
 }
@@ -244,6 +246,8 @@ impl<'a> From<&FilteredUpdateType<'a>> for GrpcSubscribeMessage {
             FilteredUpdateType::Entry { .. } => Self::Entry,
             FilteredUpdateType::BlockMeta { .. } => Self::BlockMeta,
             FilteredUpdateType::Block { .. } => Self::Block,
+            FilteredUpdateType::BlockFooter { .. } => Self::BlockFooter,
+            FilteredUpdateType::EntryUpdateParent { .. } => Self::EntryUpdateParent,
         }
     }
 }
@@ -258,6 +262,8 @@ impl GrpcSubscribeMessage {
             GrpcSubscribeMessage::Entry => "entry",
             GrpcSubscribeMessage::BlockMeta => "blockmeta",
             GrpcSubscribeMessage::Block => "block",
+            GrpcSubscribeMessage::BlockFooter => "blockfooter",
+            GrpcSubscribeMessage::EntryUpdateParent => "entryupdateparent",
             GrpcSubscribeMessage::Ping => "ping",
             GrpcSubscribeMessage::Pong => "pong",
         }

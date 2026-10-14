@@ -1,6 +1,6 @@
 use {
     criterion::Criterion,
-    richat_benches::fixtures::generate_slots,
+    richat_benches::fixtures::{BANK_ID, generate_slots},
     richat_filter::message::{Message, MessageParserEncoding},
     richat_plugin_agave::protobuf::{ProtobufEncoder, ProtobufMessage},
     std::{borrow::Cow, hint::black_box, time::SystemTime},
@@ -15,6 +15,7 @@ pub fn bench_parse_slots(criterion: &mut Criterion) {
         .map(|s| {
             let (slot, parent, status) = s.to_replica();
             let msg = ProtobufMessage::Slot {
+                bank_id: Some(BANK_ID),
                 slot,
                 parent,
                 status,

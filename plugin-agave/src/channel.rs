@@ -101,6 +101,7 @@ impl Sender {
                         slot: parent,
                         parent: entry.parent_slot,
                         status,
+                        bank_id: None,
                     };
                     let data = message.encode(encoder);
                     messages.push((message, data));
@@ -317,7 +318,11 @@ impl Receiver {
                 PluginNotification::Transaction if !self.enable_notifications_transactions => {
                     continue;
                 }
-                PluginNotification::Entry if !self.enable_notifications_entries => continue,
+                PluginNotification::Entry | PluginNotification::EntryUpdateParent
+                    if !self.enable_notifications_entries =>
+                {
+                    continue;
+                }
                 _ => {}
             }
             break Ok(Some(item));

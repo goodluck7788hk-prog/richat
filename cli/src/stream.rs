@@ -105,6 +105,8 @@ pub async fn handle_stream(
                 Some(UpdateOneof::Block(_)) => (&mut pb_blocks_c, &pb_blocks),
                 Some(UpdateOneof::Ping(_)) => (&mut pb_pp_c, &pb_pp),
                 Some(UpdateOneof::Pong(_)) => (&mut pb_pp_c, &pb_pp),
+                Some(UpdateOneof::BlockFooter(_)) => (&mut pb_blocks_c, &pb_blocks),
+                Some(UpdateOneof::EntryUpdateParent(_)) => (&mut pb_entries_c, &pb_entries),
                 None => {
                     pb_multi.println("update not found in the message")?;
                     break;
@@ -191,6 +193,36 @@ pub async fn handle_stream(
             }
             Some(UpdateOneof::Ping(_)) => {}
             Some(UpdateOneof::Pong(_)) => {}
+            Some(UpdateOneof::BlockFooter(msg)) => {
+                print_update(
+                    "blockfooter",
+                    created_at,
+                    &filters,
+                    json!({
+                        "slot": msg.slot,
+                        "bankId": msg.bank_id,
+                        "bankHash": const_hex::encode(&msg.bank_hash),
+                        "blockProducerTimeNanos": msg.block_producer_time_nanos,
+                        "blockUserAgent": String::from_utf8_lossy(&msg.block_user_agent),
+                        "blockFinalCert": msg.block_final_cert.is_some(),
+                        "skipRewardCert": msg.skip_reward_cert.is_some(),
+                        "notarRewardCert": msg.notar_reward_cert.is_some(),
+                    }),
+                );
+            }
+            Some(UpdateOneof::EntryUpdateParent(msg)) => {
+                print_update(
+                    "entryupdateparent",
+                    created_at,
+                    &filters,
+                    json!({
+                        "slot": msg.slot,
+                        "clearedBankId": msg.cleared_bank_id,
+                        "parentSlot": msg.parent_slot,
+                        "parentBlockId": const_hex::encode(&msg.parent_block_id),
+                    }),
+                );
+            }
             None => {
                 error!("update not found in the message");
                 break;

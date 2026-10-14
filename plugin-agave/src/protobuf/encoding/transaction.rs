@@ -7,7 +7,7 @@ use {
         encoding::{self, DecodeContext, WireType, encoded_len_varint, key_len},
     },
     solana_account_decoder::parse_token::UiTokenAmount,
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_message::{
         MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
         v0::MessageAddressTableLookup, v1::TransactionConfig,
@@ -27,11 +27,20 @@ use {
 pub struct Transaction<'a> {
     slot: Slot,
     transaction: &'a ReplicaTransactionInfoV3<'a>,
+    bank_id: BankId,
 }
 
 impl<'a> Transaction<'a> {
-    pub const fn new(slot: Slot, transaction: &'a ReplicaTransactionInfoV3<'a>) -> Self {
-        Self { slot, transaction }
+    pub const fn new(
+        slot: Slot,
+        transaction: &'a ReplicaTransactionInfoV3<'a>,
+        bank_id: BankId,
+    ) -> Self {
+        Self {
+            slot,
+            transaction,
+            bank_id,
+        }
     }
 }
 
@@ -42,6 +51,9 @@ impl Message for Transaction<'_> {
         if self.slot != 0 {
             encoding::uint64::encode(2, &self.slot, buf);
         }
+        if self.bank_id != 0 {
+            encoding::uint64::encode(3, &self.bank_id, buf);
+        }
     }
 
     fn encoded_len(&self) -> usize {
@@ -49,6 +61,11 @@ impl Message for Transaction<'_> {
         encoding::message::encoded_len(1, &tx)
             + if self.slot != 0 {
                 encoding::uint64::encoded_len(2, &self.slot)
+            } else {
+                0
+            }
+            + if self.bank_id != 0 {
+                encoding::uint64::encoded_len(3, &self.bank_id)
             } else {
                 0
             }

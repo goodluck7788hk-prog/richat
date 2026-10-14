@@ -597,6 +597,7 @@ struct FuzzTransaction {
 struct FuzzTransactionMessage {
     slot: u64,
     transaction: FuzzTransaction,
+    bank_id: u64,
 }
 
 libfuzzer_sys::fuzz_target!(|fuzz_message: FuzzTransactionMessage| {
@@ -617,6 +618,7 @@ libfuzzer_sys::fuzz_target!(|fuzz_message: FuzzTransactionMessage| {
     };
 
     let message = ProtobufMessage::Transaction {
+        bank_id: fuzz_message.bank_id,
         slot: fuzz_message.slot,
         transaction: &replica,
     };

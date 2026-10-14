@@ -50,6 +50,7 @@ pub struct FuzzBlockMeta<'a> {
     block_height: Option<u64>,
     executed_transaction_count: u64,
     entry_count: u64,
+    bank_id: u64,
 }
 
 libfuzzer_sys::fuzz_target!(|fuzz_blockmeta: FuzzBlockMeta| {
@@ -81,6 +82,7 @@ libfuzzer_sys::fuzz_target!(|fuzz_blockmeta: FuzzBlockMeta| {
     };
 
     let message = ProtobufMessage::BlockMeta {
+        bank_id: fuzz_blockmeta.bank_id,
         blockinfo: &blockinfo,
     };
     let created_at = SystemTime::now();

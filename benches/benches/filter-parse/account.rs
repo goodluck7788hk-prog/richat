@@ -1,6 +1,6 @@
 use {
     criterion::Criterion,
-    richat_benches::fixtures::generate_accounts,
+    richat_benches::fixtures::{BANK_ID, generate_accounts},
     richat_filter::message::{Message, MessageParserEncoding},
     richat_plugin_agave::protobuf::{ProtobufEncoder, ProtobufMessage},
     std::{borrow::Cow, hint::black_box, time::SystemTime},
@@ -15,6 +15,7 @@ pub fn bench_parse_accounts(criterion: &mut Criterion) {
         .map(|acc| {
             let (slot, replica) = acc.to_replica();
             let msg = ProtobufMessage::Account {
+                bank_id: Some(BANK_ID),
                 slot,
                 account: &replica,
             };

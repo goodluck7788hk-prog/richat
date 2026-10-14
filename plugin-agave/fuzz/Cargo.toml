@@ -48,18 +48,18 @@ doc = false
 bench = false
 
 [dependencies]
-agave-geyser-plugin-interface = "4.2.0"
-arbitrary = { version = "1.4.1", features = ["derive"] }
-const-hex = "1.14.0"
-libfuzzer-sys = "0.4.8"
+agave-geyser-plugin-interface = "4.3.0"
+arbitrary = { version = "1.4.2", features = ["derive"] }
+const-hex = "1.19.3"
+libfuzzer-sys = "0.4.13"
 richat-plugin-agave = { path = ".." }
-solana-account-decoder = { version = "4.2.0", features = ["agave-unstable-api"] }
-solana-hash = "4.3.0"
-solana-instruction-error = "2.3.0"
-solana-message = "4.1.1"
-solana-pubkey = { version = "4.2.0", features = ["rand"] }
-solana-signature = { version = "3.4.0", features = ["rand"] }
-solana-transaction = "4.1.1"
-solana-transaction-context = { version = "4.2.0", features = ["agave-unstable-api"] }
-solana-transaction-error = "3.2.0"
-solana-transaction-status = { version = "4.2.0", features = ["agave-unstable-api"] }
+solana-account-decoder = { version = "4.3.0", features = ["agave-unstable-api"] }
+solana-hash = "4.6.0"
+solana-instruction-error = "2.5.0"
+solana-message = "4.5.0"
+solana-pubkey = { version = "4.3.0", features = ["rand"] }
+solana-signature = { version = "3.5.2", features = ["rand"] }
+solana-transaction = "4.2.0"
+solana-transaction-context = { version = "4.3.0", features = ["agave-unstable-api"] }
+solana-transaction-error = "3.4.0"
+solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }

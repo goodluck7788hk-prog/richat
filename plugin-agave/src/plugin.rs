@@ -7,15 +7,16 @@ use {
         version::VERSION,
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
-        ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
-        SlotStatus,
+        GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions,
+        ReplicaBlockFooterInfoVersions, ReplicaBlockInfoVersions, ReplicaEntryInfoVersions,
+        ReplicaEntryUpdateParentInfoVersions, ReplicaTransactionInfoVersions,
+        Result as PluginResult, SlotStatus,
     },
     futures::future::BoxFuture,
     log::error,
     richat_metrics::{MaybeRecorder, gauge},
     richat_shared::transports::{grpc::GrpcServer, quic::QuicServer},
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     std::{fmt, sync::Arc, time::Duration},
     tokio::{runtime::Runtime, task::JoinError},
     tokio_util::sync::CancellationToken,
@@ -28,6 +29,8 @@ pub enum PluginNotification {
     Transaction,
     Entry,
     BlockMeta,
+    BlockFooter,
+    EntryUpdateParent,
 }
 
 impl From<&ProtobufMessage<'_>> for PluginNotification {
@@ -38,6 +41,8 @@ impl From<&ProtobufMessage<'_>> for PluginNotification {
             ProtobufMessage::Transaction { .. } => Self::Transaction,
             ProtobufMessage::Entry { .. } => Self::Entry,
             ProtobufMessage::BlockMeta { .. } => Self::BlockMeta,
+            ProtobufMessage::BlockFooter { .. } => Self::BlockFooter,
+            ProtobufMessage::EntryUpdateParent { .. } => Self::EntryUpdateParent,
         }
     }
 }
@@ -57,6 +62,8 @@ pub struct PluginInner {
     runtime: Runtime,
     messages: Sender,
     encoder: ProtobufEncoder,
+    block_footer: bool,
+    entry_update_parent: bool,
     shutdown: CancellationToken,
     tasks: Vec<(&'static str, PluginTask)>,
 }
@@ -144,6 +151,8 @@ impl PluginInner {
             runtime,
             messages,
             encoder: config.channel.encoder,
+            block_footer: config.block_footer,
+            entry_update_parent: config.entry_update_parent,
             shutdown,
             tasks,
         })
@@ -153,6 +162,29 @@ impl PluginInner {
 #[derive(Debug, Default)]
 pub struct Plugin {
     inner: Option<PluginInner>,
+}
+
+impl Plugin {
+    fn push_slot(
+        &self,
+        slot: Slot,
+        parent: Option<u64>,
+        status: &SlotStatus,
+        bank_id: Option<BankId>,
+    ) -> PluginResult<()> {
+        let inner = self.inner.as_ref().expect("initialized");
+        inner.messages.push(
+            ProtobufMessage::Slot {
+                slot,
+                parent,
+                status,
+                bank_id,
+            },
+            inner.encoder,
+        );
+
+        Ok(())
+    }
 }
 
 impl GeyserPlugin for Plugin {
@@ -194,28 +226,31 @@ impl GeyserPlugin for Plugin {
         }
     }
 
-    fn update_account(
+    fn update_account_for_bank(
         &self,
         account: ReplicaAccountInfoVersions,
-        slot: u64,
-        is_startup: bool,
+        slot: Slot,
+        bank_id: BankId,
     ) -> PluginResult<()> {
-        if !is_startup {
-            let account = match account {
-                ReplicaAccountInfoVersions::V0_0_1(_info) => {
-                    unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
-                }
-                ReplicaAccountInfoVersions::V0_0_2(_info) => {
-                    unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
-                }
-                ReplicaAccountInfoVersions::V0_0_3(info) => info,
-            };
+        let account = match account {
+            ReplicaAccountInfoVersions::V0_0_1(_info) => {
+                unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
+            }
+            ReplicaAccountInfoVersions::V0_0_2(_info) => {
+                unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
+            }
+            ReplicaAccountInfoVersions::V0_0_3(info) => info,
+        };
 
-            let inner = self.inner.as_ref().expect("initialized");
-            inner
-                .messages
-                .push(ProtobufMessage::Account { slot, account }, inner.encoder);
-        }
+        let inner = self.inner.as_ref().expect("initialized");
+        inner.messages.push(
+            ProtobufMessage::Account {
+                slot,
+                account,
+                bank_id: Some(bank_id),
+            },
+            inner.encoder,
+        );
 
         Ok(())
     }
@@ -230,23 +265,24 @@ impl GeyserPlugin for Plugin {
         parent: Option<u64>,
         status: &SlotStatus,
     ) -> PluginResult<()> {
-        let inner = self.inner.as_ref().expect("initialized");
-        inner.messages.push(
-            ProtobufMessage::Slot {
-                slot,
-                parent,
-                status,
-            },
-            inner.encoder,
-        );
-
-        Ok(())
+        self.push_slot(slot, parent, status, None)
     }
 
-    fn notify_transaction(
+    fn update_bank_status(
+        &self,
+        slot: Slot,
+        parent: Option<u64>,
+        status: &SlotStatus,
+        bank_id: BankId,
+    ) -> PluginResult<()> {
+        self.push_slot(slot, parent, status, Some(bank_id))
+    }
+
+    fn notify_transaction_for_bank(
         &self,
         transaction: ReplicaTransactionInfoVersions<'_>,
         slot: u64,
+        bank_id: BankId,
     ) -> PluginResult<()> {
         let transaction = match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(_info) => {
@@ -260,14 +296,22 @@ impl GeyserPlugin for Plugin {
 
         let inner = self.inner.as_ref().expect("initialized");
         inner.messages.push(
-            ProtobufMessage::Transaction { slot, transaction },
+            ProtobufMessage::Transaction {
+                slot,
+                transaction,
+                bank_id,
+            },
             inner.encoder,
         );
 
         Ok(())
     }
 
-    fn notify_entry(&self, entry: ReplicaEntryInfoVersions) -> PluginResult<()> {
+    fn notify_entry_for_bank(
+        &self,
+        entry: ReplicaEntryInfoVersions,
+        bank_id: BankId,
+    ) -> PluginResult<()> {
         #[allow(clippy::infallible_destructuring_match)]
         let entry = match entry {
             ReplicaEntryInfoVersions::V0_0_1(_entry) => {
@@ -279,12 +323,16 @@ impl GeyserPlugin for Plugin {
         let inner = self.inner.as_ref().expect("initialized");
         inner
             .messages
-            .push(ProtobufMessage::Entry { entry }, inner.encoder);
+            .push(ProtobufMessage::Entry { entry, bank_id }, inner.encoder);
 
         Ok(())
     }
 
-    fn notify_block_metadata(&self, blockinfo: ReplicaBlockInfoVersions<'_>) -> PluginResult<()> {
+    fn notify_block_metadata_for_bank(
+        &self,
+        blockinfo: ReplicaBlockInfoVersions<'_>,
+        bank_id: BankId,
+    ) -> PluginResult<()> {
         let blockinfo = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(_info) => {
                 unreachable!("ReplicaBlockInfoVersions::V0_0_1 is not supported")
@@ -299,9 +347,42 @@ impl GeyserPlugin for Plugin {
         };
 
         let inner = self.inner.as_ref().expect("initialized");
-        inner
-            .messages
-            .push(ProtobufMessage::BlockMeta { blockinfo }, inner.encoder);
+        inner.messages.push(
+            ProtobufMessage::BlockMeta { blockinfo, bank_id },
+            inner.encoder,
+        );
+
+        Ok(())
+    }
+
+    fn notify_block_footer(
+        &self,
+        block_footer: ReplicaBlockFooterInfoVersions,
+        bank_id: BankId,
+    ) -> PluginResult<()> {
+        let ReplicaBlockFooterInfoVersions::V0_0_1(footer) = block_footer;
+
+        let inner = self.inner.as_ref().expect("initialized");
+        inner.messages.push(
+            ProtobufMessage::BlockFooter { footer, bank_id },
+            inner.encoder,
+        );
+
+        Ok(())
+    }
+
+    fn notify_entry_update_parent(
+        &self,
+        update_parent: ReplicaEntryUpdateParentInfoVersions,
+    ) -> PluginResult<()> {
+        let inner = self.inner.as_ref().expect("initialized");
+        if inner.entry_update_parent {
+            let ReplicaEntryUpdateParentInfoVersions::V0_0_1(update_parent) = update_parent;
+            inner.messages.push(
+                ProtobufMessage::EntryUpdateParent { update_parent },
+                inner.encoder,
+            );
+        }
 
         Ok(())
     }
@@ -320,6 +401,10 @@ impl GeyserPlugin for Plugin {
 
     fn entry_notifications_enabled(&self) -> bool {
         true
+    }
+
+    fn block_footer_notifications_enabled(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.block_footer)
     }
 }
 

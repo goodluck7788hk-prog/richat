@@ -1,6 +1,6 @@
 use {
     criterion::Criterion,
-    richat_benches::fixtures::generate_entries,
+    richat_benches::fixtures::{BANK_ID, generate_entries},
     richat_plugin_agave::protobuf::{ProtobufEncoder, ProtobufMessage},
     std::{hint::black_box, time::SystemTime},
 };
@@ -18,7 +18,10 @@ pub fn bench_encode_entries(criterion: &mut Criterion) {
                 #[allow(clippy::unit_arg)]
                 black_box({
                     for entry in entries {
-                        let message = ProtobufMessage::Entry { entry };
+                        let message = ProtobufMessage::Entry {
+                            bank_id: BANK_ID,
+                            entry,
+                        };
                         message.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
                     }
                 })
@@ -30,7 +33,10 @@ pub fn bench_encode_entries(criterion: &mut Criterion) {
                 #[allow(clippy::unit_arg)]
                 black_box({
                     for entry in entries {
-                        let message = ProtobufMessage::Entry { entry };
+                        let message = ProtobufMessage::Entry {
+                            bank_id: BANK_ID,
+                            entry,
+                        };
                         message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
                     }
                 })

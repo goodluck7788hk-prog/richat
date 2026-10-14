@@ -1,6 +1,6 @@
 use {
     criterion::Criterion,
-    richat_benches::fixtures::generate_transactions,
+    richat_benches::fixtures::{BANK_ID, generate_transactions},
     richat_filter::message::{Message, MessageParserEncoding},
     richat_plugin_agave::protobuf::{ProtobufEncoder, ProtobufMessage},
     std::{borrow::Cow, hint::black_box, time::SystemTime},
@@ -15,6 +15,7 @@ pub fn bench_parse_transactions(criterion: &mut Criterion) {
         .map(|tx| {
             let (slot, replica) = tx.to_replica();
             let msg = ProtobufMessage::Transaction {
+                bank_id: BANK_ID,
                 slot,
                 transaction: &replica,
             };
