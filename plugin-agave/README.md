@@ -8,3 +8,10 @@ cargo build -p richat-plugin-agave --lib --release --features="rustls-install-de
 ```
 
 If you run plugin on mainnet validator do not try to do it in `debug` mode, validator would start fall behind.
+
+Bank-aware notifications preserve the validator's source-local bank IDs. The
+`block_footer` and `entry_update_parent` options are disabled by default. Enabling
+them requires consumers using the Yellowstone gRPC proto 14 schema, including
+typed Alpenglow certificates. Entry parent markers follow the entry subscription
+filter. Invalid finalization signatures omit the final certificate while the
+remaining footer fields are still sent.

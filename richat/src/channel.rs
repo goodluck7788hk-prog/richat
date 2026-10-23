@@ -74,7 +74,23 @@ impl GlobalReplayFromSlot {
 
     pub fn store(&self, slot: Slot) {
         let mut locked = mutex_lock(&self.inner);
+        if locked.value.is_none_or(|previous| slot > previous) {
+            locked.sources_replay_failed.clear();
+        }
         locked.value = Some(locked.value.unwrap_or(slot).max(slot));
+    }
+
+    pub fn report_replay_failed_at(
+        &self,
+        source_name: &'static str,
+        requested: Option<Slot>,
+    ) -> bool {
+        let mut locked = mutex_lock(&self.inner);
+        if locked.value != requested {
+            return false;
+        }
+        locked.sources_replay_failed.insert(source_name);
+        locked.sources_replay_failed.len() >= locked.sources_total
     }
 
     /// Reports that a source failed to replay. Returns `true` if all sources
@@ -144,8 +160,8 @@ impl ParsedMessage {
             Self::Entry(_msg) => "entry",
             Self::BlockMeta(_msg) => "blockmeta",
             Self::Block(_msg) => "block",
-            Self::BlockFooter(_msg) => "blockfooter",
-            Self::EntryUpdateParent(_msg) => "entryupdateparent",
+            Self::BlockFooter(_) => "blockfooter",
+            Self::EntryUpdateParent(_) => "entryupdateparent",
         }
     }
 
@@ -175,6 +191,20 @@ impl ParsedMessage {
         }
     }
 
+    pub fn bank_id(&self) -> Option<u64> {
+        match self {
+            Self::Slot(message) => message.bank_id(),
+            Self::Account(message) => message.bank_id(),
+            Self::Transaction(message) => Some(message.bank_id()),
+            Self::Entry(message) => Some(message.bank_id()),
+            Self::BlockMeta(message) => Some(message.bank_id()),
+            Self::Block(message) => Some(message.bank_id()),
+            Self::BlockFooter(message) => Some(message.bank_id()),
+            Self::EntryUpdateParent(message) => Some(message.cleared_bank_id()),
+        }
+        .filter(|bank_id| *bank_id != 0)
+    }
+
     fn get_account(&self) -> Option<Arc<MessageAccount>> {
         if let Self::Account(msg) = self {
             Some(Arc::clone(msg))
@@ -200,6 +230,7 @@ impl ParsedMessage {
     }
 
     fn get_id<H: Hasher>(&self, mut state: H) -> u64 {
+        self.bank_id().hash(&mut state);
         match self {
             ParsedMessage::Slot(msg) => {
                 state.write_u8(0);
@@ -210,6 +241,7 @@ impl ParsedMessage {
                 state.write_u8(1);
                 state.write_u64(msg.slot());
                 state.write(msg.pubkey().as_ref());
+                state.write_u64(msg.write_version());
                 // signature doesn't exist for block reward and system account updates
                 if let Some(signature) = msg.txn_signature() {
                     state.write(signature);
@@ -233,15 +265,13 @@ impl ParsedMessage {
                 state.write_u8(5);
                 state.write_u64(msg.slot());
             }
-            ParsedMessage::BlockFooter(msg) => {
+            ParsedMessage::BlockFooter(message) => {
                 state.write_u8(6);
-                state.write_u64(msg.slot());
-                state.write_u64(msg.bank_id());
+                state.write_u64(message.slot());
             }
-            ParsedMessage::EntryUpdateParent(msg) => {
+            ParsedMessage::EntryUpdateParent(message) => {
                 state.write_u8(7);
-                state.write_u64(msg.slot());
-                state.write_u64(msg.cleared_bank_id());
+                state.write_u64(message.slot());
             }
         }
         state.finish()
@@ -320,12 +350,18 @@ impl Messages {
         let hasher = RandomState::default();
         let mut replay_from_slot = None;
         let mut replay = BTreeMap::new();
+        let mut recovered_sources = BTreeMap::new();
         let mut index = 0;
         if let Some(storage) = &self.storage {
             let slots = storage.read_slots();
 
             for (slot, item) in slots.iter() {
                 replay.insert(*slot, ReplayInfo::new(item.head));
+                if !item.finalized
+                    && let Some(source) = &item.source
+                {
+                    recovered_sources.insert(*slot, source.clone());
+                }
             }
             gauge!(metrics::CHANNEL_STORAGE_SLOTS_TOTAL).set(replay.len() as f64);
             update_storage_slot_metrics(&replay);
@@ -337,6 +373,7 @@ impl Messages {
                 .max()
             {
                 slot_finalized = finalized_slot;
+                recovered_sources.retain(|slot, _| *slot > finalized_slot);
                 let Some(replay_index) = slots.get(&(finalized_slot + 1)).map(|item| item.head)
                 else {
                     anyhow::bail!("failed to get replay index to load messages");
@@ -348,6 +385,11 @@ impl Messages {
                         if msg.slot() <= finalized_slot {
                             continue;
                         }
+                        anyhow::ensure!(
+                            msg.bank_id().is_none() || recovered_sources.contains_key(&msg.slot()),
+                            "bank-aware durable recovery requires persisted source ownership for slot {}",
+                            msg.slot()
+                        );
 
                         let Some(replay) = replay.get_mut(&msg.slot()) else {
                             anyhow::bail!(
@@ -366,22 +408,42 @@ impl Messages {
             }
         }
 
+        let incomplete_slots = replay
+            .iter()
+            .filter(|(_, info)| info.messages.is_some())
+            .map(|(slot, _)| *slot)
+            .collect();
         let replay = Arc::new(Mutex::new(replay));
         self.replay_info = Some(Arc::clone(&replay));
 
         let global_replay_from_slot = GlobalReplayFromSlot::new(replay_from_slot, sources_total);
         let sender = Sender {
             slots: BTreeMap::new(),
-            dedup: BTreeMap::new(),
-            processed: SenderShared::new(&self.shared_processed, self.max_messages, self.max_bytes),
-            confirmed: self
-                .shared_confirmed
-                .as_ref()
-                .map(|shared| SenderShared::new(shared, self.max_messages, self.max_bytes)),
-            finalized: self
-                .shared_finalized
-                .as_ref()
-                .map(|shared| SenderShared::new(shared, self.max_messages, self.max_bytes)),
+            dedup: recovered_sources
+                .iter()
+                .map(|(slot, source)| {
+                    (
+                        *slot,
+                        DedupInfo {
+                            source: Some(source.clone()),
+                            banks: BTreeMap::new(),
+                        },
+                    )
+                })
+                .collect(),
+            recovered_sources,
+            processed: SenderShared::new(
+                &self.shared_processed,
+                self.max_messages,
+                self.max_bytes,
+                incomplete_slots,
+            ),
+            confirmed: self.shared_confirmed.as_ref().map(|shared| {
+                SenderShared::new(shared, self.max_messages, self.max_bytes, HashSet::new())
+            }),
+            finalized: self.shared_finalized.as_ref().map(|shared| {
+                SenderShared::new(shared, self.max_messages, self.max_bytes, HashSet::new())
+            }),
             slot_confirmed: 0,
             slot_finalized,
             global_replay_from_slot: global_replay_from_slot.clone(),
@@ -418,6 +480,10 @@ impl Messages {
         self.get_shared(commitment).tail.load(Ordering::Relaxed)
     }
 
+    pub fn get_next_index(&self, commitment: CommitmentLevel) -> u64 {
+        self.get_current_tail(commitment).wrapping_add(1)
+    }
+
     pub fn get_current_tail_with_replay(
         &self,
         commitment: CommitmentLevel,
@@ -425,10 +491,24 @@ impl Messages {
     ) -> Result<IndexLocation, String> {
         if let Some(replay_from_slot) = replay_from_slot {
             if commitment == CommitmentLevel::Processed {
+                if let Some(index) =
+                    self.replay_info
+                        .as_deref()
+                        .map(mutex_lock)
+                        .and_then(|replay| {
+                            replay
+                                .get(&replay_from_slot)
+                                .filter(|info| info.messages.is_some())
+                                .map(|info| info.head)
+                        })
+                {
+                    return Ok(IndexLocation::Storage(index));
+                }
                 if let Some(index) = self
                     .get_shared(commitment)
                     .slots_lock()
                     .get(&replay_from_slot)
+                    .filter(|info| info.complete)
                     .map(|obj| obj.head)
                 {
                     Ok(IndexLocation::Memory(index))
@@ -448,7 +528,7 @@ impl Messages {
                 Err("replay `from_slot` available only for `processed` commitment".to_owned())
             }
         } else {
-            let index = self.get_shared(commitment).tail.load(Ordering::Relaxed);
+            let index = self.get_next_index(commitment);
             Ok(IndexLocation::Memory(index))
         }
     }
@@ -463,7 +543,8 @@ impl Messages {
         let slot_processed = self
             .shared_processed
             .slots_lock()
-            .first_key_value()
+            .iter()
+            .find(|(_, info)| info.complete)
             .map(|(slot, _head)| *slot);
 
         match (slot_replay, slot_processed) {
@@ -497,18 +578,24 @@ impl Subscribe for Messages {
         let head = if let Some(replay_from_slot) = replay_from_slot {
             let state = self.shared_processed.slots_lock();
             match state.get(&replay_from_slot) {
-                Some(obj) => obj.head,
-                None => {
-                    return Err(match state.keys().min().copied() {
-                        Some(first_available) => {
-                            SubscribeError::SlotNotAvailable { first_available }
-                        }
-                        None => SubscribeError::NotInitialized,
-                    });
+                Some(obj) if obj.complete => obj.head,
+                _ => {
+                    return Err(
+                        match state
+                            .iter()
+                            .find(|(_, info)| info.complete)
+                            .map(|(slot, _)| *slot)
+                        {
+                            Some(first_available) => {
+                                SubscribeError::SlotNotAvailable { first_available }
+                            }
+                            None => SubscribeError::NotInitialized,
+                        },
+                    );
                 }
             }
         } else {
-            self.shared_processed.tail.load(Ordering::Relaxed)
+            self.get_next_index(CommitmentLevel::Processed)
         };
 
         let filter = filter.unwrap_or_default();
@@ -520,6 +607,8 @@ impl Subscribe for Messages {
             enable_notifications_accounts: !filter.disable_accounts,
             enable_notifications_transactions: !filter.disable_transactions,
             enable_notifications_entries: !filter.disable_entries,
+            #[cfg(test)]
+            before_wait: None,
         }
         .boxed())
     }
@@ -529,6 +618,7 @@ impl Subscribe for Messages {
 pub struct Sender {
     slots: BTreeMap<Slot, SlotInfo>,
     dedup: BTreeMap<Slot, DedupInfo>,
+    recovered_sources: BTreeMap<Slot, Arc<str>>,
     processed: SenderShared,
     confirmed: Option<SenderShared>,
     finalized: Option<SenderShared>,
@@ -542,20 +632,113 @@ pub struct Sender {
     replay: Arc<Mutex<BTreeMap<Slot, ReplayInfo>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupMode {
+    Disabled,
+    SingleSource,
+    MultiSource,
+}
+
+impl From<bool> for DedupMode {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::MultiSource
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 impl Sender {
-    pub fn push(&mut self, dedup_required: bool, source_name: &'static str, message: Message) {
+    pub fn push(
+        &mut self,
+        dedup: impl Into<DedupMode>,
+        source_name: &'static str,
+        message: Message,
+    ) -> anyhow::Result<()> {
+        let dedup_mode = dedup.into();
         let slot = message.slot();
+        let bank_id = message.bank_id().filter(|bank_id| *bank_id != 0);
+        let late_footer = matches!(message, Message::BlockFooter(_)) && slot <= self.slot_finalized;
+        let owner = self
+            .dedup
+            .get(&slot)
+            .and_then(|info| info.source.as_deref());
+        if owner.is_some_and(|owner| owner != source_name) {
+            anyhow::ensure!(
+                !self.recovered_sources.contains_key(&slot),
+                "recovered slot {slot} belongs to source {}, not {source_name}",
+                owner.unwrap()
+            );
+            return Ok(());
+        }
+        if matches!(&message, Message::Slot(message) if message.status() == SlotStatus::SlotFinalized)
+            && let Some((pending_slot, pending)) = self.slots.range(..slot).find(|(_, info)| {
+                !info.finalized
+                    && (info.unresolved_finality
+                        || info
+                            .source
+                            .as_deref()
+                            .is_some_and(|owner| owner != source_name))
+            })
+        {
+            anyhow::bail!(
+                "cannot finalize slot {slot} from source {source_name}: unresolved slot {pending_slot} belongs to source {}; refusing to advance replay",
+                pending.source.as_deref().unwrap_or("unresolved")
+            );
+        }
+        if matches!(&message, Message::Slot(message) if message.status() == SlotStatus::SlotFinalized)
+            && bank_id.is_none()
+            && let Some(info) = self.slots.get_mut(&slot)
+            && info.select_bank(None).is_none()
+        {
+            info.unresolved_finality = true;
+            return Ok(());
+        }
+        if matches!(&message, Message::Slot(message) if message.status() == SlotStatus::SlotFinalized)
+            && let Some((pending_slot, owner)) = self.recovered_sources.range(..slot).next()
+        {
+            anyhow::bail!(
+                "cannot finalize slot {slot}: recovered slot {pending_slot} from source {owner} remains unresolved; refusing to advance replay"
+            );
+        }
 
         // early return, probably nothing can be received after finalized slot status?
-        if slot <= self.slot_finalized {
-            return;
+        if slot <= self.slot_finalized && !late_footer {
+            return Ok(());
+        }
+        if late_footer
+            && (!self.processed.shared.slots_lock().contains_key(&slot)
+                || !self
+                    .slots
+                    .get(&slot)
+                    .is_some_and(|info| info.accepts_late_footer(source_name, bank_id)))
+        {
+            return Ok(());
+        }
+        if let Some(bank_id) = bank_id
+            && !matches!(message, Message::EntryUpdateParent(_))
+            && self
+                .slots
+                .get(&slot)
+                .is_some_and(|info| info.cleared_banks.contains(&bank_id))
+        {
+            return Ok(());
+        }
+        let slot_dedup = self.dedup.entry(slot).or_default();
+        if let Some(source) = slot_dedup.source.as_deref() {
+            if source != source_name {
+                return Ok(());
+            }
+        } else if bank_id.is_some() {
+            slot_dedup.source = Some(Arc::from(source_name));
         }
 
         // get or create slot info
         let mut messages = SmallVec::<[ParsedMessage; 4]>::new();
-        if dedup_required {
+        if dedup_mode != DedupMode::Disabled && !late_footer {
             // dedup info
-            let dedup = self.dedup.entry(slot).or_default();
+            let dedup = slot_dedup.banks.entry(bank_id).or_default();
 
             match message {
                 Message::Slot(msg) => {
@@ -566,10 +749,15 @@ impl Sender {
                     }
                 }
                 Message::Account(mut msg) => {
-                    let key = DedupInfoAccountTransactionKey::from(&msg);
-                    if dedup.accounts_updates.insert(key) {
-                        if let Some(signature) = key.signature {
-                            match dedup.transactions.entry(signature) {
+                    let mut key = DedupInfoAccountTransactionKey::from(&msg);
+                    if dedup_mode == DedupMode::SingleSource {
+                        key.write_version = Some(msg.write_version());
+                    }
+                    if dedup.accounts_updates().insert(key) {
+                        if dedup_mode == DedupMode::SingleSource {
+                            messages.push(ParsedMessage::Account(Arc::new(msg)));
+                        } else if let Some(signature) = key.signature {
+                            match dedup.transactions().entry(signature) {
                                 HashMapEntry::Occupied(mut entry) => match entry.get_mut() {
                                     DedupInfoTransactionIndex::Index(index) => {
                                         msg.update_write_version(*index as u64);
@@ -594,7 +782,7 @@ impl Sender {
                 Message::Transaction(msg) => {
                     // we keep some space for account updates without signature
                     let index = msg.index() as usize + 1_000;
-                    match dedup.transactions.entry(msg.signature()) {
+                    match dedup.transactions().entry(msg.signature()) {
                         HashMapEntry::Occupied(mut entry) => {
                             let entry = entry.get_mut();
                             if let DedupInfoTransactionIndex::Accounts(vec) = entry {
@@ -616,8 +804,14 @@ impl Sender {
                 Message::Entry(msg) => {
                     let index = msg.index() as usize;
                     if dedup.entries.len() <= index {
+                        let required = index
+                            .checked_add(1)
+                            .and_then(usize::checked_next_power_of_two)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("entry index {index} exceeds capacity")
+                            })?;
                         dedup.entries.resize(
-                            index.next_power_of_two().max(dedup.entries.len() * 2),
+                            required.max(dedup.entries.len().saturating_mul(2)).max(256),
                             false,
                         );
                     }
@@ -632,14 +826,14 @@ impl Sender {
                         messages.push(ParsedMessage::BlockMeta(Arc::new(msg)));
                     }
                 }
-                Message::BlockFooter(msg) => {
-                    if dedup.block_footers.insert(msg.bank_id()) {
-                        messages.push(ParsedMessage::BlockFooter(Arc::new(msg)));
+                Message::BlockFooter(message) => {
+                    if dedup.block_footers.insert(message.bank_id()) {
+                        messages.push(ParsedMessage::BlockFooter(Arc::new(message)));
                     }
                 }
-                Message::EntryUpdateParent(msg) => {
-                    if dedup.entry_update_parents.insert(msg.cleared_bank_id()) {
-                        messages.push(ParsedMessage::EntryUpdateParent(Arc::new(msg)));
+                Message::EntryUpdateParent(message) => {
+                    if dedup.entry_update_parents.insert(message.cleared_bank_id()) {
+                        messages.push(ParsedMessage::EntryUpdateParent(Arc::new(message)));
                     }
                 }
                 Message::Block(_) => unreachable!(),
@@ -650,9 +844,15 @@ impl Sender {
 
         // push messages
         let mut replay_lock = mutex_lock(&self.replay);
-        let (replay, replay_inserted) = match replay_lock.entry(slot) {
-            BTreeMapEntry::Vacant(entry) => (entry.insert(ReplayInfo::new(self.index)), true),
-            BTreeMapEntry::Occupied(entry) => (entry.into_mut(), false),
+        let persist_message = !late_footer || replay_lock.contains_key(&slot);
+        let mut transient_replay = ReplayInfo::new(self.index);
+        let (replay, replay_inserted) = if persist_message {
+            match replay_lock.entry(slot) {
+                BTreeMapEntry::Vacant(entry) => (entry.insert(ReplayInfo::new(self.index)), true),
+                BTreeMapEntry::Occupied(entry) => (entry.into_mut(), false),
+            }
+        } else {
+            (&mut transient_replay, false)
         };
         let mut clean_after_finalized = false;
         for message in messages {
@@ -668,8 +868,24 @@ impl Sender {
                 slot_init = true;
                 SlotInfo::new(slot, self.index)
             });
+            if slot_info.source.is_none() {
+                slot_info.source = slot_dedup.source.clone();
+            }
+            let mut source_to_persist = if self.storage.is_some() && !slot_info.source_persisted {
+                slot_info.source.clone()
+            } else {
+                None
+            };
             let slot_index_head = slot_info.index;
             let block_message = slot_info.get_block_message(&message);
+            let commitment_bank_id = if let ParsedMessage::Slot(message) = &message {
+                slot_info.commit(
+                    message.status(),
+                    message.bank_id().filter(|bank_id| *bank_id != 0),
+                )
+            } else {
+                None
+            };
 
             for message in [Some(message), block_message].into_iter().flatten() {
                 if let Some(messages) = &mut replay.messages
@@ -694,13 +910,20 @@ impl Sender {
                         let processed_slots_len = self.processed.shared.slots_lock().len();
                         debug!(
                             "new processed {slot} / {} messages / {} slots / {} bytes",
-                            self.processed.tail - self.processed.head,
+                            self.processed
+                                .tail
+                                .wrapping_sub(self.processed.head)
+                                .wrapping_add(1),
                             processed_slots_len,
                             self.processed.bytes_total
                         );
 
-                        gauge!(metrics::CHANNEL_MESSAGES_TOTAL)
-                            .set((self.processed.tail - self.processed.head) as f64);
+                        gauge!(metrics::CHANNEL_MESSAGES_TOTAL).set(
+                            self.processed
+                                .tail
+                                .wrapping_sub(self.processed.head)
+                                .wrapping_add(1) as f64,
+                        );
                         gauge!(metrics::CHANNEL_SLOTS_TOTAL).set(processed_slots_len as f64);
                         gauge!(metrics::CHANNEL_BYTES_TOTAL).set(self.processed.bytes_total as f64);
                     }
@@ -714,35 +937,50 @@ impl Sender {
                     }
 
                     // push messages to confirmed
-                    if msg.status() == SlotStatus::SlotConfirmed {
-                        self.slot_confirmed = slot;
+                    if msg.status() == SlotStatus::SlotConfirmed
+                        && let Some(bank_id) = commitment_bank_id
+                    {
+                        self.slot_confirmed = self.slot_confirmed.max(slot);
                         if let Some(shared) = self.confirmed.as_mut()
                             && let Some(slot_info) = self.slots.get(&slot)
                         {
-                            for message in slot_info.get_messages_cloned() {
+                            for message in slot_info.get_messages_cloned(bank_id) {
                                 shared.push(slot, message, None);
                             }
                         }
                     }
 
                     // push messages to finalized
-                    if msg.status() == SlotStatus::SlotFinalized {
+                    if msg.status() == SlotStatus::SlotFinalized
+                        && let Some(bank_id) = commitment_bank_id
+                    {
                         clean_after_finalized = true;
-                        self.slot_finalized = slot;
+                        self.slot_finalized = self.slot_finalized.max(slot);
                         self.global_replay_from_slot.store(slot + 1);
+                        self.recovered_sources.remove(&slot);
                         if let Some(shared) = self.finalized.as_mut()
-                            && let Some(mut slot_info) = self.slots.remove(&slot)
+                            && let Some(slot_info) = self.slots.get_mut(&slot)
                         {
-                            for message in slot_info.get_messages_owned() {
+                            for message in slot_info.get_messages_owned(bank_id) {
                                 shared.push(slot, message, None);
                             }
+                        }
+                        if let Some(slot_info) = self.slots.get_mut(&slot) {
+                            slot_info.compact_finalized(bank_id);
                         }
                     }
                 } else {
                     // push to confirmed (if we received SlotStatus or message after it)
-                    if slot <= self.slot_confirmed
+                    if !matches!(message, ParsedMessage::EntryUpdateParent(_))
+                        && self
+                            .slots
+                            .get(&slot)
+                            .is_some_and(|info| info.confirmed_bank == Some(message.bank_id()))
                         && let Some(shared) = self.confirmed.as_mut()
                     {
+                        shared.push(slot, message.clone(), None);
+                    }
+                    if late_footer && let Some(shared) = self.finalized.as_mut() {
                         shared.push(slot, message.clone(), None);
                     }
                 }
@@ -750,15 +988,24 @@ impl Sender {
                 // push to storage
                 let mut replay_index = None;
                 if let Some(storage) = &self.storage
+                    && persist_message
                     && !matches!(&message, ParsedMessage::Block(_))
                 {
-                    storage.push_message(
+                    let persists_source = source_to_persist.is_some();
+                    storage.push_message_with_source(
                         slot_init,
                         slot,
                         slot_index_head,
                         self.index,
                         message.clone(),
-                    );
+                        source_to_persist.take(),
+                    )?;
+                    if persists_source {
+                        self.slots
+                            .get_mut(&slot)
+                            .expect("existing slot")
+                            .source_persisted = true;
+                    }
                     slot_init = false;
                     replay_index = Some(self.index);
                     self.index += 1;
@@ -770,14 +1017,17 @@ impl Sender {
         }
 
         if clean_after_finalized {
-            loop {
-                match self.slots.keys().next().copied() {
-                    Some(slot_min) if slot_min <= self.slot_finalized => {
-                        self.slots.remove(&slot_min);
-                    }
-                    _ => break,
-                }
-            }
+            let first_retained = self
+                .processed
+                .shared
+                .slots_lock()
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or(slot);
+            self.slots.retain(|slot, info| {
+                *slot > self.slot_finalized || (info.finalized && *slot >= first_retained)
+            });
             loop {
                 match self.dedup.keys().next().copied() {
                     Some(slot_min) if slot_min < self.slot_finalized => {
@@ -806,11 +1056,16 @@ impl Sender {
         }
         update_memory_slot_metrics(&self.processed.shared.slots_lock());
 
-        if let Some(mut wakers) = self.processed.shared.wakers_lock() {
-            for waker in wakers.drain(..) {
-                waker.wake();
-            }
+        let wakers = self
+            .processed
+            .shared
+            .wakers_lock()
+            .and_then(|mut wakers| (!wakers.is_empty()).then(|| std::mem::take(&mut *wakers)));
+        drop(replay_lock);
+        for waker in wakers.into_iter().flatten() {
+            waker.wake();
         }
+        Ok(())
     }
 }
 
@@ -821,16 +1076,23 @@ struct SenderShared {
     tail: u64,
     bytes_total: usize,
     bytes_max: usize,
+    incomplete_slots: HashSet<Slot>,
 }
 
 impl SenderShared {
-    fn new(shared: &Arc<SharedChannel>, max_messages: usize, max_bytes: usize) -> Self {
+    fn new(
+        shared: &Arc<SharedChannel>,
+        max_messages: usize,
+        max_bytes: usize,
+        incomplete_slots: HashSet<Slot>,
+    ) -> Self {
         Self {
             shared: Arc::clone(shared),
             head: max_messages as u64 + 1,
             tail: max_messages as u64,
             bytes_total: 0,
             bytes_max: max_bytes,
+            incomplete_slots,
         }
     }
 
@@ -877,9 +1139,10 @@ impl SenderShared {
         self.shared.tail.store(self.tail, Ordering::Relaxed);
 
         // update slot head info
-        slots_lock
-            .entry(slot)
-            .or_insert_with(|| SlotHead { head: self.tail });
+        slots_lock.entry(slot).or_insert_with(|| SlotHead {
+            head: self.tail,
+            complete: !self.incomplete_slots.contains(&slot),
+        });
 
         // remove not-complete slots
         if let Some(remove_upto) = removed_max_slot {
@@ -904,46 +1167,59 @@ pub struct ReceiverAsync {
     enable_notifications_accounts: bool,
     enable_notifications_transactions: bool,
     enable_notifications_entries: bool,
+    #[cfg(test)]
+    before_wait: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
 
 impl ReceiverAsync {
     fn recv_ref(&mut self, waker: &Waker) -> Result<Option<RecvItem>, RecvError> {
-        let tail = self.shared.tail.load(Ordering::Relaxed);
-        while self.head <= tail {
-            let idx = self.shared.get_idx(self.head);
-            let item = self.shared.buffer_idx(idx);
-            if item.pos != self.head {
-                return Err(RecvError::Lagged);
-            }
-            self.head = self.head.wrapping_add(1);
+        loop {
+            let tail = self.shared.tail.load(Ordering::Relaxed);
+            while self.head <= tail {
+                let idx = self.shared.get_idx(self.head);
+                let item = self.shared.buffer_idx(idx);
+                if item.pos != self.head {
+                    return Err(RecvError::Lagged);
+                }
+                self.head = self.head.wrapping_add(1);
 
-            let item = item.data.as_ref().ok_or(RecvError::Lagged)?;
-            match item {
-                ParsedMessage::Account(_) if !self.enable_notifications_accounts => continue,
-                ParsedMessage::Transaction(_) if !self.enable_notifications_transactions => {
+                let item = item.data.as_ref().ok_or(RecvError::Lagged)?;
+                match item {
+                    ParsedMessage::Account(_) if !self.enable_notifications_accounts => continue,
+                    ParsedMessage::Transaction(_) if !self.enable_notifications_transactions => {
+                        continue;
+                    }
+                    ParsedMessage::Entry(_) | ParsedMessage::EntryUpdateParent(_)
+                        if !self.enable_notifications_entries =>
+                    {
+                        continue;
+                    }
+                    ParsedMessage::Block(_) => continue,
+                    _ => {}
+                }
+
+                let data = FilteredUpdate {
+                    filters: SmallVec::new_const(),
+                    filtered_update: MessageRef::from(item).into(),
+                }
+                .encode_to_vec();
+                return Ok(Some(Arc::new(data)));
+            }
+
+            #[cfg(test)]
+            if let Some((ready, published)) = self.before_wait.take() {
+                ready.wait();
+                published.wait();
+            }
+
+            if let Some(mut wakers) = self.shared.wakers_lock() {
+                if self.head <= self.shared.tail.load(Ordering::Relaxed) {
                     continue;
                 }
-                ParsedMessage::Entry(_) | ParsedMessage::EntryUpdateParent(_)
-                    if !self.enable_notifications_entries =>
-                {
-                    continue;
-                }
-                ParsedMessage::Block(_) => continue,
-                _ => {}
+                wakers.push(waker.clone());
             }
-
-            let data = FilteredUpdate {
-                filters: SmallVec::new_const(),
-                filtered_update: MessageRef::from(item).into(),
-            }
-            .encode_to_vec();
-            return Ok(Some(Arc::new(data)));
+            return Ok(None);
         }
-
-        if let Some(mut wakers) = self.shared.wakers_lock() {
-            wakers.push(waker.clone());
-        }
-        Ok(None)
     }
 }
 
@@ -989,7 +1265,7 @@ impl ReceiverSync {
         };
 
         let tail = shared.tail.load(Ordering::Relaxed);
-        if head < tail {
+        if head <= tail {
             let idx = shared.get_idx(head);
             let item = shared.buffer_idx(idx);
             if item.pos != head {
@@ -1008,7 +1284,7 @@ pub struct SharedChannel {
     mask: u64,
     buffer: Box<[Mutex<Item>]>,
     slots: Mutex<BTreeMap<Slot, SlotHead>>,
-    wakers: Option<Mutex<Vec<Waker>>>,
+    wakers: Option<Mutex<SmallVec<[Waker; 16]>>>,
 }
 
 impl fmt::Debug for SharedChannel {
@@ -1102,7 +1378,7 @@ impl SharedChannel {
     }
 
     #[inline]
-    fn wakers_lock(&self) -> Option<MutexGuard<'_, Vec<Waker>>> {
+    fn wakers_lock(&self) -> Option<MutexGuard<'_, SmallVec<[Waker; 16]>>> {
         self.wakers.as_ref().map(mutex_lock)
     }
 }
@@ -1148,10 +1424,155 @@ struct Item {
 #[derive(Debug, Clone, Copy)]
 struct SlotHead {
     head: u64,
+    complete: bool,
+}
+
+#[derive(Debug)]
+struct SlotInfo {
+    slot: Slot,
+    index: u64,
+    source: Option<Arc<str>>,
+    source_persisted: bool,
+    confirmed_bank: Option<Option<u64>>,
+    finalized: bool,
+    unresolved_finality: bool,
+    banks: BTreeMap<Option<u64>, BankInfo>,
+    cleared_banks: HashSet<u64>,
+}
+
+impl SlotInfo {
+    fn new(slot: Slot, index: u64) -> Self {
+        Self {
+            slot,
+            index,
+            source: None,
+            source_persisted: false,
+            confirmed_bank: None,
+            finalized: false,
+            unresolved_finality: false,
+            banks: BTreeMap::new(),
+            cleared_banks: HashSet::new(),
+        }
+    }
+
+    fn select_bank(&self, bank_id: Option<u64>) -> Option<Option<u64>> {
+        if let Some(bank_id) = bank_id {
+            return (!self.cleared_banks.contains(&bank_id)).then_some(Some(bank_id));
+        }
+        self.confirmed_bank.or_else(|| {
+            if self.banks.is_empty() {
+                Some(None)
+            } else if self.banks.len() == 1 {
+                self.banks.keys().next().copied()
+            } else {
+                None
+            }
+        })
+    }
+
+    fn commit(&mut self, status: SlotStatus, bank_id: Option<u64>) -> Option<Option<u64>> {
+        if !matches!(
+            status,
+            SlotStatus::SlotConfirmed | SlotStatus::SlotFinalized
+        ) {
+            return None;
+        }
+        if status == SlotStatus::SlotConfirmed && self.confirmed_bank.is_some() {
+            return None;
+        }
+        let bank_id = self.select_bank(bank_id)?;
+        if let Some(bank) = self.banks.get_mut(&bank_id) {
+            bank.landed = true;
+        }
+        if status == SlotStatus::SlotConfirmed {
+            self.confirmed_bank = Some(bank_id);
+        }
+        if status == SlotStatus::SlotFinalized {
+            self.finalized = true;
+            self.unresolved_finality = false;
+        }
+        Some(bank_id)
+    }
+
+    fn get_block_message(&mut self, message: &ParsedMessage) -> Option<ParsedMessage> {
+        if let ParsedMessage::EntryUpdateParent(message) = message {
+            let bank_id = message.cleared_bank_id();
+            self.cleared_banks.insert(bank_id);
+            if self.confirmed_bank == Some(Some(bank_id)) {
+                self.confirmed_bank = None;
+            }
+            if let Some(mut bank) = self.banks.remove(&Some(bank_id)) {
+                bank.failed = true;
+            }
+            return None;
+        }
+        let mut bank_id = message.bank_id();
+        if let ParsedMessage::Slot(message) = message
+            && bank_id.is_none()
+        {
+            if !matches!(
+                message.status(),
+                SlotStatus::SlotConfirmed | SlotStatus::SlotFinalized
+            ) {
+                return None;
+            }
+            bank_id = self.select_bank(None)?;
+        }
+        self.banks
+            .entry(bank_id)
+            .or_insert_with(|| BankInfo::new(self.slot))
+            .get_block_message(message)
+    }
+
+    fn get_messages_cloned(
+        &self,
+        bank_id: Option<u64>,
+    ) -> impl Iterator<Item = ParsedMessage> + '_ {
+        self.banks
+            .get(&bank_id)
+            .into_iter()
+            .flat_map(|bank| bank.messages.iter())
+            .filter_map(|message| message.as_ref().cloned())
+    }
+
+    fn get_messages_owned(
+        &mut self,
+        bank_id: Option<u64>,
+    ) -> impl Iterator<Item = ParsedMessage> + '_ {
+        self.banks
+            .get_mut(&bank_id)
+            .into_iter()
+            .flat_map(|bank| bank.messages.drain(..))
+            .flatten()
+    }
+
+    fn compact_finalized(&mut self, selected: Option<u64>) {
+        self.banks.retain(|bank_id, bank| {
+            if *bank_id != selected {
+                bank.failed = true;
+                return false;
+            }
+            bank.messages.clear();
+            bank.messages.shrink_to_fit();
+            bank.accounts_dedup.clear();
+            bank.accounts_dedup.shrink_to_fit();
+            bank.block_meta = None;
+            true
+        });
+    }
+
+    fn accepts_late_footer(&self, source: &'static str, bank_id: Option<u64>) -> bool {
+        self.finalized
+            && self.source.as_deref() == Some(source)
+            && self
+                .banks
+                .get(&bank_id)
+                .is_some_and(|bank| !bank.footer_seen)
+    }
 }
 
 #[derive(Debug, Default)]
-struct SlotInfo {
+struct BankInfo {
     slot: Slot,
     block_created: bool,
     failed: bool,
@@ -1161,10 +1582,10 @@ struct SlotInfo {
     transactions_count: usize,
     entries_count: usize,
     block_meta: Option<Arc<MessageBlockMeta>>,
-    index: u64,
+    footer_seen: bool,
 }
 
-impl Drop for SlotInfo {
+impl Drop for BankInfo {
     fn drop(&mut self) {
         if !self.block_created && !self.failed && self.landed {
             let mut reasons = vec![];
@@ -1192,33 +1613,28 @@ impl Drop for SlotInfo {
     }
 }
 
-impl SlotInfo {
-    fn new(slot: Slot, index: u64) -> Self {
+impl BankInfo {
+    fn new(slot: Slot) -> Self {
         Self {
             slot,
             block_created: false,
             failed: false,
             landed: false,
-            messages: Vec::with_capacity(16_384),
+            messages: Vec::new(),
             accounts_dedup: HashMap::default(),
             transactions_count: 0,
             entries_count: 0,
             block_meta: None,
-            index,
+            footer_seen: false,
         }
     }
 
     fn get_block_message(&mut self, message: &ParsedMessage) -> Option<ParsedMessage> {
-        // footers and entry parent updates are not part of the block message,
-        // but must be replayed to confirmed / finalized receivers
-        if matches!(
-            message,
-            ParsedMessage::BlockFooter(_) | ParsedMessage::EntryUpdateParent(_)
-        ) {
+        if matches!(message, ParsedMessage::BlockFooter(_)) {
+            self.footer_seen = true;
             self.messages.push(Some(message.clone()));
             return None;
         }
-
         // mark as landed
         if let ParsedMessage::Slot(message) = message
             && matches!(
@@ -1262,7 +1678,7 @@ impl SlotInfo {
             ParsedMessage::Account(message) => {
                 let idx_new = self.messages.len();
                 let item = ParsedMessage::Account(Arc::clone(message));
-                self.messages.push(Some(item));
+                self.push_payload(item);
 
                 let pubkey = message.pubkey();
                 let write_version = message.write_version();
@@ -1270,6 +1686,8 @@ impl SlotInfo {
                     if entry.0 < write_version {
                         self.messages[entry.1] = None;
                         *entry = (write_version, idx_new);
+                    } else {
+                        self.messages[idx_new] = None;
                     }
                 } else {
                     self.accounts_dedup
@@ -1279,17 +1697,17 @@ impl SlotInfo {
             ParsedMessage::Slot(_message) => {}
             ParsedMessage::Transaction(message) => {
                 let item = ParsedMessage::Transaction(Arc::clone(message));
-                self.messages.push(Some(item));
+                self.push_payload(item);
                 self.transactions_count += 1;
             }
             ParsedMessage::Entry(message) => {
                 let item = ParsedMessage::Entry(Arc::clone(message));
-                self.messages.push(Some(item));
+                self.push_payload(item);
                 self.entries_count += 1
             }
             ParsedMessage::BlockMeta(message) => {
                 let item = ParsedMessage::BlockMeta(Arc::clone(message));
-                self.messages.push(Some(item));
+                self.push_payload(item);
                 self.block_meta = Some(Arc::clone(message));
             }
             ParsedMessage::Block(_)
@@ -1326,7 +1744,7 @@ impl SlotInfo {
                 Arc::clone(block_meta),
                 block_meta.created_at(),
             )));
-            self.messages.push(Some(block.clone()));
+            self.push_payload(block.clone());
 
             return Some(block);
         }
@@ -1334,14 +1752,11 @@ impl SlotInfo {
         None
     }
 
-    fn get_messages_cloned(&self) -> impl Iterator<Item = ParsedMessage> + '_ {
-        self.messages
-            .iter()
-            .filter_map(|item| item.as_ref().cloned())
-    }
-
-    fn get_messages_owned(&mut self) -> impl Iterator<Item = ParsedMessage> + '_ {
-        self.messages.drain(..).flatten()
+    fn push_payload(&mut self, message: ParsedMessage) {
+        if self.messages.capacity() < 16_384 {
+            self.messages.reserve(16_384 - self.messages.len());
+        }
+        self.messages.push(Some(message));
     }
 }
 
@@ -1376,8 +1791,26 @@ mod tests {
     }
 }
 
-#[derive(Debug)]
+#[cfg(test)]
+mod regression_tests;
+
+#[cfg(test)]
+mod bank_tests;
+
+#[cfg(test)]
+mod storage_tests;
+
+#[cfg(test)]
+mod performance_tests;
+
+#[derive(Debug, Default)]
 struct DedupInfo {
+    source: Option<Arc<str>>,
+    banks: BTreeMap<Option<u64>, DedupBank>,
+}
+
+#[derive(Debug)]
+struct DedupBank {
     slots: [bool; 7],
     accounts_updates: HashSet<DedupInfoAccountTransactionKey, RandomState>,
     accounts_updates_phantom_index: u64,
@@ -1388,14 +1821,14 @@ struct DedupInfo {
     entry_update_parents: HashSet<u64>,
 }
 
-impl Default for DedupInfo {
+impl Default for DedupBank {
     fn default() -> Self {
         Self {
             slots: [false; 7],
-            accounts_updates: HashSet::with_capacity_and_hasher(8_192, RandomState::default()),
+            accounts_updates: HashSet::with_hasher(RandomState::default()),
             accounts_updates_phantom_index: 0,
-            transactions: HashMap::with_capacity_and_hasher(8_192, RandomState::default()),
-            entries: std::iter::repeat_n(false, 256).collect(),
+            transactions: HashMap::with_hasher(RandomState::default()),
+            entries: Vec::new(),
             block_meta: false,
             block_footers: HashSet::new(),
             entry_update_parents: HashSet::new(),
@@ -1403,10 +1836,27 @@ impl Default for DedupInfo {
     }
 }
 
+impl DedupBank {
+    fn accounts_updates(&mut self) -> &mut HashSet<DedupInfoAccountTransactionKey, RandomState> {
+        if self.accounts_updates.capacity() == 0 {
+            self.accounts_updates.reserve(8_192);
+        }
+        &mut self.accounts_updates
+    }
+
+    fn transactions(&mut self) -> &mut HashMap<Signature, DedupInfoTransactionIndex, RandomState> {
+        if self.transactions.capacity() == 0 {
+            self.transactions.reserve(8_192);
+        }
+        &mut self.transactions
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DedupInfoAccountTransactionKey {
     signature: Option<Signature>,
     pubkey: Pubkey,
+    write_version: Option<u64>,
 }
 
 impl From<&MessageAccount> for DedupInfoAccountTransactionKey {
@@ -1416,6 +1866,7 @@ impl From<&MessageAccount> for DedupInfoAccountTransactionKey {
                 .txn_signature()
                 .map(|sig| sig.try_into().expect("valid signature")),
             pubkey: *value.pubkey(),
+            write_version: None,
         }
     }
 }

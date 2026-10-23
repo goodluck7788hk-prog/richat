@@ -54,7 +54,7 @@ impl Sender {
                 slots: BTreeMap::new(),
                 bytes_total: 0,
                 bytes_max: config.max_bytes,
-                wakers: Vec::with_capacity(16),
+                wakers: SmallVec::new(),
             }),
             mask: (max_messages - 1) as u64,
             buffer: buffer.into_boxed_slice(),
@@ -65,7 +65,7 @@ impl Sender {
 
     pub fn push(&self, message: ProtobufMessage, encoder: ProtobufEncoder) {
         // encode message
-        let data = message.encode(encoder);
+        let data = Arc::new(message.encode(encoder));
 
         // acquire state lock
         let mut state = self.shared.state_lock();
@@ -79,7 +79,7 @@ impl Sender {
             None
         };
 
-        let mut messages = SmallVec::<[(ProtobufMessage, Vec<u8>); 2]>::new();
+        let mut messages = SmallVec::<[(ProtobufMessage, RecvItem); 2]>::new();
         messages.push((message, data));
 
         if let Some((slot, status)) = slot_status {
@@ -103,7 +103,7 @@ impl Sender {
                         status,
                         bank_id: None,
                     };
-                    let data = message.encode(encoder);
+                    let data = Arc::new(message.encode(encoder));
                     messages.push((message, data));
 
                     error!("missed slot status update for {} ({:?})", parent, *status);
@@ -116,17 +116,27 @@ impl Sender {
         }
 
         // push messages
+        let mut evicted = SmallVec::<[RecvItem; 8]>::new();
         for (message, data) in messages.into_iter().rev() {
-            self.push_msg(&mut state, message, data);
+            self.push_msg(&mut state, message, data, &mut evicted);
         }
 
         // notify receivers
-        for waker in state.wakers.drain(..) {
+        let wakers = (!state.wakers.is_empty()).then(|| std::mem::take(&mut state.wakers));
+        drop(state);
+        for waker in wakers.into_iter().flatten() {
             waker.wake();
         }
+        drop(evicted);
     }
 
-    fn push_msg(&self, state: &mut MutexGuard<'_, State>, message: ProtobufMessage, data: Vec<u8>) {
+    fn push_msg(
+        &self,
+        state: &mut MutexGuard<'_, State>,
+        message: ProtobufMessage,
+        data: RecvItem,
+        evicted: &mut SmallVec<[RecvItem; 8]>,
+    ) {
         let mut removed_max_slot = None;
 
         // bump current tail
@@ -156,26 +166,28 @@ impl Sender {
         state.bytes_total += data.len();
         let idx = self.shared.get_idx(state.tail);
         let mut item = self.shared.buffer_idx(idx);
-        if let Some(message) = item.data.take() {
+        if let Some((_, data)) = item.data.take() {
             state.head = state.head.wrapping_add(1);
-            state.bytes_total -= message.1.len();
+            state.bytes_total -= data.len();
             removed_max_slot = Some(item.slot);
+            evicted.push(data);
         }
         item.pos = state.tail;
         item.slot = slot;
-        item.data = Some((PluginNotification::from(&message), Arc::new(data)));
+        item.data = Some((PluginNotification::from(&message), data));
         drop(item);
 
         // drop extra messages by max bytes
         while state.bytes_total >= state.bytes_max && state.head < state.tail {
             let idx = self.shared.get_idx(state.head);
             let mut item = self.shared.buffer_idx(idx);
-            let Some(message) = item.data.take() else {
+            let Some((_, data)) = item.data.take() else {
                 panic!("nothing to remove to keep bytes under limit")
             };
 
             state.head = state.head.wrapping_add(1);
-            state.bytes_total -= message.1.len();
+            state.bytes_total -= data.len();
+            evicted.push(data);
             removed_max_slot = Some(match removed_max_slot {
                 Some(slot) => item.slot.max(slot),
                 None => item.slot,
@@ -204,13 +216,13 @@ impl Sender {
             if *status == SlotStatus::Processed {
                 debug!(
                     "new processed {slot} / {} messages / {} slots / {} bytes",
-                    state.tail - state.head,
+                    state.tail.wrapping_sub(state.head).wrapping_add(1),
                     state.slots.len(),
                     state.bytes_total
                 );
 
                 gauge!(&self.recorder, metrics::CHANNEL_MESSAGES_TOTAL)
-                    .set((state.tail - state.head) as f64);
+                    .set(state.tail.wrapping_sub(state.head).wrapping_add(1) as f64);
                 gauge!(&self.recorder, metrics::CHANNEL_SLOTS_TOTAL).set(state.slots.len() as f64);
                 gauge!(&self.recorder, metrics::CHANNEL_BYTES_TOTAL).set(state.bytes_total as f64);
             }
@@ -223,7 +235,9 @@ impl Sender {
         }
 
         let mut state = self.shared.state_lock();
-        for waker in state.wakers.drain(..) {
+        let wakers = (!state.wakers.is_empty()).then(|| std::mem::take(&mut state.wakers));
+        drop(state);
+        for waker in wakers.into_iter().flatten() {
             waker.wake();
         }
     }
@@ -247,7 +261,7 @@ impl Subscribe for Sender {
                     None => SubscribeError::NotInitialized,
                 }
             })?,
-            None => state.tail,
+            None => state.tail.wrapping_add(1),
         };
         drop(state);
 
@@ -410,7 +424,7 @@ struct State {
     slots: BTreeMap<Slot, SlotInfo>,
     bytes_total: usize,
     bytes_max: usize,
-    wakers: Vec<Waker>,
+    wakers: SmallVec<[Waker; 16]>,
 }
 
 struct SlotInfo {
@@ -419,6 +433,9 @@ struct SlotInfo {
     confirmed: bool,
     finalized: bool,
 }
+
+#[cfg(test)]
+mod tests;
 
 struct Item {
     pos: u64,

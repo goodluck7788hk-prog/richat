@@ -212,7 +212,6 @@ mod tests {
         let final_cert = encode_block_footer(&cert).block_final_cert.unwrap();
         assert_eq!(final_cert.slot, 10);
 
-        // slow finalization: final aggregate votes on the slot, notar aggregate on the block
         let final_aggregate = final_cert.final_aggregate.unwrap();
         assert_eq!(
             final_aggregate.signature,
@@ -232,9 +231,280 @@ mod tests {
 
     #[test]
     pub fn test_encode_block_footer_invalid_cert_dropped() {
-        // all-zero signature is not a valid BLS point: the cert is dropped, the footer still sent
         let cert = solana_entry::block_component::BlockFinalizationCert::new_for_tests();
         assert!(encode_block_footer(&cert).block_final_cert.is_none());
+    }
+
+    #[test]
+    fn test_encode_block_footer_fast_finalization() {
+        use {
+            agave_votor_messages::certificate::CertSignature,
+            solana_bls_signatures::{Keypair, Signature, SignatureCompressed},
+            solana_entry::block_component::{BlockFinalizationCert, VotesAggregate},
+            solana_hash::Hash,
+        };
+
+        let signature = Signature::from(Keypair::new().sign(b"fast finalize"));
+        let cert = BlockFinalizationCert {
+            slot: 10,
+            block_id: Hash::new_from_array([2; 32]),
+            final_aggregate: VotesAggregate::from_cert_signature(CertSignature {
+                signature,
+                bitmap: vec![6, 7],
+            }),
+            notar_aggregate: None,
+        };
+        let final_cert = encode_block_footer(&cert).block_final_cert.unwrap();
+        assert!(final_cert.notar_aggregate.is_none());
+        let aggregate = final_cert.final_aggregate.unwrap();
+        assert_eq!(aggregate.signature_kind, 0);
+        assert_eq!(
+            aggregate.signature,
+            SignatureCompressed::try_from(&signature).unwrap().0
+        );
+        assert_eq!(aggregate.block_id, vec![2; 32]);
+        assert_eq!(aggregate.signer_bitmap, vec![6, 7]);
+    }
+
+    #[test]
+    fn test_encode_block_footer_reward_certificates_survive_invalid_final_cert() {
+        use {
+            agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaBlockFooterInfo,
+            agave_votor_messages::{
+                certificate::CertSignature,
+                reward_certificate::{NotarRewardCertificate, SkipRewardCertificate},
+            },
+            solana_bls_signatures::{Keypair, Signature, SignatureCompressed},
+            solana_entry::block_component::{
+                BlockFinalizationCert, BlockFooterV1, VersionedBlockFooter, VotesAggregate,
+            },
+            solana_hash::Hash,
+        };
+
+        let signature = Signature::from(Keypair::new().sign(b"reward"));
+        let compressed = SignatureCompressed::try_from(&signature).unwrap();
+        let invalid = BlockFinalizationCert::new_for_tests();
+        let cert = BlockFinalizationCert {
+            slot: 10,
+            block_id: Hash::new_from_array([2; 32]),
+            final_aggregate: VotesAggregate::from_cert_signature(CertSignature {
+                signature,
+                bitmap: vec![6],
+            }),
+            notar_aggregate: Some(invalid.final_aggregate),
+        };
+        for final_cert in [None, Some(cert)] {
+            let footer = VersionedBlockFooter::V1(BlockFooterV1 {
+                bank_hash: Hash::new_from_array([7; 32]),
+                block_producer_time_nanos: 99,
+                block_user_agent: b"agent".to_vec(),
+                block_final_cert: final_cert,
+                skip_reward_cert: Some(
+                    SkipRewardCertificate::try_new(8, compressed, vec![1, 2]).unwrap(),
+                ),
+                notar_reward_cert: Some(
+                    NotarRewardCertificate::try_new(
+                        9,
+                        Hash::new_from_array([3; 32]),
+                        compressed,
+                        vec![4, 5],
+                    )
+                    .unwrap(),
+                ),
+            });
+            let replica = ReplicaBlockFooterInfo {
+                slot: 10,
+                block_footer: &footer,
+            };
+            let message = ProtobufMessage::BlockFooter {
+                footer: &replica,
+                bank_id: BANK_ID,
+            };
+            let created_at = SystemTime::now();
+            let raw = message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+            assert_eq!(
+                raw,
+                message.encode_with_timestamp(ProtobufEncoder::Prost, created_at)
+            );
+            let Some(UpdateOneof::BlockFooter(footer)) = SubscribeUpdate::decode(raw.as_slice())
+                .unwrap()
+                .update_oneof
+            else {
+                panic!("expected footer")
+            };
+            assert!(footer.block_final_cert.is_none());
+            assert_eq!((footer.slot, footer.bank_id), (10, BANK_ID));
+            assert_eq!(footer.bank_hash, vec![7; 32]);
+            let skip = footer.skip_reward_cert.unwrap();
+            assert_eq!(skip.slot, 8);
+            let skip = skip.aggregate.unwrap();
+            assert_eq!(skip.signature_kind, 0);
+            assert_eq!(skip.signature, compressed.0);
+            assert!(skip.block_id.is_empty());
+            assert_eq!(skip.signer_bitmap, vec![1, 2]);
+            let notar = footer.notar_reward_cert.unwrap();
+            assert_eq!(notar.slot, 9);
+            let notar = notar.aggregate.unwrap();
+            assert_eq!(notar.signature_kind, 0);
+            assert_eq!(notar.signature, compressed.0);
+            assert_eq!(notar.block_id, vec![3; 32]);
+            assert_eq!(notar.signer_bitmap, vec![4, 5]);
+        }
+    }
+
+    #[test]
+    fn optional_bank_id_distinguishes_missing_from_zero() {
+        let account = generate_accounts().into_iter().next().unwrap();
+        let (slot, replica) = account.to_replica();
+        let created_at = SystemTime::now();
+        for bank_id in [None, Some(0), Some(BANK_ID), Some(u64::MAX)] {
+            let account = ProtobufMessage::Account {
+                slot,
+                account: &replica,
+                bank_id,
+            };
+            let slot = ProtobufMessage::Slot {
+                slot,
+                parent: Some(0),
+                status:
+                    &agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus::Processed,
+                bank_id,
+            };
+            for message in [account, slot] {
+                let raw = message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+                assert_eq!(
+                    raw,
+                    message.encode_with_timestamp(ProtobufEncoder::Prost, created_at)
+                );
+                let update = SubscribeUpdate::decode(raw.as_slice())
+                    .unwrap()
+                    .update_oneof
+                    .unwrap();
+                match update {
+                    UpdateOneof::Account(account) => assert_eq!(account.bank_id, bank_id),
+                    UpdateOneof::Slot(slot) => assert_eq!(slot.bank_id, bank_id),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn required_bank_ids_preserve_zero_and_maximum_values() {
+        let block = generate_block_metas().into_iter().next().unwrap();
+        let block = block.to_replica();
+        let entry = generate_entries().into_iter().next().unwrap();
+        let entry = entry.to_replica();
+        let transaction = generate_transactions().into_iter().next().unwrap();
+        let (slot, transaction) = transaction.to_replica();
+        let created_at = SystemTime::now();
+        for bank_id in [0, BANK_ID, u64::MAX] {
+            for message in [
+                ProtobufMessage::BlockMeta {
+                    blockinfo: &block,
+                    bank_id,
+                },
+                ProtobufMessage::Entry {
+                    entry: &entry,
+                    bank_id,
+                },
+                ProtobufMessage::Transaction {
+                    slot,
+                    transaction: &transaction,
+                    bank_id,
+                },
+            ] {
+                let raw = message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+                assert_eq!(
+                    raw,
+                    message.encode_with_timestamp(ProtobufEncoder::Prost, created_at)
+                );
+                match SubscribeUpdate::decode(raw.as_slice())
+                    .unwrap()
+                    .update_oneof
+                    .unwrap()
+                {
+                    UpdateOneof::BlockMeta(update) => assert_eq!(update.bank_id, bank_id),
+                    UpdateOneof::Entry(update) => assert_eq!(update.bank_id, bank_id),
+                    UpdateOneof::Transaction(update) => assert_eq!(update.bank_id, bank_id),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v1_config_presence_and_bank_id_survive_both_encoders() {
+        use {
+            solana_hash::Hash,
+            solana_message::{
+                VersionedMessage,
+                v1::{Message, TransactionConfig},
+            },
+        };
+
+        for config in [
+            TransactionConfig::default(),
+            TransactionConfig {
+                priority_fee: Some(0),
+                compute_unit_limit: Some(0),
+                loaded_accounts_data_size_limit: Some(0),
+                heap_size: Some(0),
+            },
+            TransactionConfig {
+                priority_fee: Some(16_385),
+                compute_unit_limit: Some(200_000),
+                loaded_accounts_data_size_limit: Some(128_000),
+                heap_size: Some(65_536),
+            },
+        ] {
+            let mut fixture = generate_transactions().into_iter().next().unwrap();
+            let previous = &fixture.versioned_transaction.message;
+            fixture.versioned_transaction.message = VersionedMessage::V1(Message {
+                header: *previous.header(),
+                config,
+                lifetime_specifier: Hash::new_from_array([7; 32]),
+                account_keys: previous.static_account_keys().to_vec(),
+                instructions: previous.instructions().to_vec(),
+            });
+            let (slot, transaction) = fixture.to_replica();
+            let message = ProtobufMessage::Transaction {
+                slot,
+                transaction: &transaction,
+                bank_id: BANK_ID,
+            };
+            let created_at = SystemTime::now();
+            let raw = message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+            assert_eq!(
+                raw,
+                message.encode_with_timestamp(ProtobufEncoder::Prost, created_at)
+            );
+            let Some(UpdateOneof::Transaction(update)) = SubscribeUpdate::decode(raw.as_slice())
+                .unwrap()
+                .update_oneof
+            else {
+                panic!("expected transaction")
+            };
+            assert_eq!(update.bank_id, BANK_ID);
+            let message = update
+                .transaction
+                .unwrap()
+                .transaction
+                .unwrap()
+                .message
+                .unwrap();
+            assert!(message.versioned);
+            assert!(message.address_table_lookups.is_empty());
+            assert_eq!(message.recent_blockhash, vec![7; 32]);
+            let encoded = message.config.unwrap();
+            assert_eq!(encoded.priority_fee, config.priority_fee);
+            assert_eq!(encoded.compute_unit_limit, config.compute_unit_limit);
+            assert_eq!(
+                encoded.loaded_accounts_data_size_limit,
+                config.loaded_accounts_data_size_limit
+            );
+            assert_eq!(encoded.heap_size, config.heap_size);
+        }
     }
 
     #[test]

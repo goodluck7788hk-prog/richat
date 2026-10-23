@@ -16,13 +16,13 @@ use {
         grpc::{ConfigGrpcClient, GrpcClientBuilderError},
         quic::{ConfigQuicClient, QuicConnectError},
     },
-    richat_filter::message::{Message, MessageParseError, MessageParserEncoding},
+    richat_filter::message::{Message, MessageParseError},
     richat_proto::{
         geyser::{
             CommitmentLevel as CommitmentLevelProto, SubscribeRequest,
-            SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocksMeta,
-            SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
-            SubscribeRequestFilterTransactions,
+            SubscribeRequestFilterAccounts, SubscribeRequestFilterBlockFooter,
+            SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry,
+            SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
         },
         richat::{GrpcSubscribeRequest, RichatFilter},
     },
@@ -66,6 +66,8 @@ pub enum ReceiveError {
     Parse(#[from] MessageParseError),
     #[error("replay from the requested slot is not available from any source")]
     ReplayFailed,
+    #[error("source sent nothing for {0:?}")]
+    Idle(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -118,8 +120,18 @@ fn is_grpc_replay_rejected(status: &tonic::Status) -> bool {
             msg.contains("first available slot")
                 || msg.contains("failed to get replay position for slot")
         }
-        // dragons mouth: broadcast from {from_slot} is not available, last available: {first_available}
+        // dragons mouth (richat-native / older yellowstone-grpc):
+        //   Internal "broadcast from {from_slot} is not available, last available: {first_available}"
+        // dragons mouth (yellowstone-grpc v14, replay_stored_slots == 0):
+        //   Internal "from_slot is not supported"
         Code::Internal => {
+            let msg = status.message();
+            msg.contains("is not available, last available")
+                || msg.contains("from_slot is not supported")
+        }
+        // dragons mouth (yellowstone-grpc v14, requested slot older than the replay buffer):
+        //   OutOfRange "broadcast from {from_slot} is not available, last available: {slot}"
+        Code::OutOfRange => {
             let msg = status.message();
             msg.contains("is not available, last available")
         }
@@ -187,82 +199,26 @@ impl Subscription {
         let name = Self::get_static_name(&config.name);
 
         let stream = if let Some(reconnect) = config.reconnect.take() {
-            let backoff = Backoff::new(reconnect);
-            try_unfold(
-                (
-                    backoff,
-                    subscription_config,
-                    config,
-                    global_replay_from_slot,
-                    None,
-                ),
-                move |mut state: (
-                    Backoff,
-                    SubscriptionConfig,
-                    ConfigChannelSourceGeneral,
-                    GlobalReplayFromSlot,
-                    Option<kanal::AsyncReceiver<SubscriptionMessage>>,
-                )| async move {
-                    loop {
-                        if let Some(stream) = state.4.as_mut() {
-                            match stream.recv().await {
-                                Ok(Ok((name, message))) => {
-                                    return Ok(Some(((name, message), state)));
-                                }
-                                Ok(Err(ReceiveError::ReplayFailed)) => {
-                                    if state.3.report_replay_failed(name) {
-                                        return Err(ReceiveError::ReplayFailed);
-                                    }
-                                    error!(name, "failed to replay, waiting for other sources");
-                                }
-                                Ok(Err(error)) => {
-                                    error!(name, ?error, "failed to receive")
-                                }
-                                Err(_) => {
-                                    error!(name, "stream is finished")
-                                }
-                            }
-                            state.4 = None;
-                            state.0.sleep().await;
-                        } else {
-                            match Subscription::subscribe(
-                                name,
-                                state.1.clone(),
-                                state.2.disable_accounts,
-                                state.2.parser,
-                                state.2.channel_size,
-                                state.3.load(),
-                            )
+            let idle_timeout = reconnect.idle_timeout;
+            Self::reconnecting_stream(
+                name,
+                Backoff::new(reconnect),
+                global_replay_from_slot,
+                move |requested| {
+                    let subscription_config = subscription_config.clone();
+                    let config = config.clone();
+                    async move {
+                        Self::subscribe(name, subscription_config, &config, idle_timeout, requested)
                             .await
-                            {
-                                Ok(stream) => {
-                                    state.4 = Some(stream);
-                                    state.0.reset();
-                                }
-                                Err(error) => {
-                                    if error.is_replay_slot_not_available() {
-                                        if state.3.report_replay_failed(name) {
-                                            return Err(ReceiveError::ReplayFailed);
-                                        }
-                                        error!(name, "failed to replay at subscribe time, waiting for other sources");
-                                    } else {
-                                        error!(name, ?error, "failed to connect");
-                                    }
-                                    state.0.sleep().await;
-                                }
-                            }
-                        }
                     }
                 },
             )
-            .boxed()
         } else {
             let rx = Self::subscribe(
                 name,
                 subscription_config,
-                config.disable_accounts,
-                config.parser,
-                config.channel_size,
+                &config,
+                None,
                 global_replay_from_slot.load(),
             )
             .await?;
@@ -278,6 +234,79 @@ impl Subscription {
             config: source_config,
             stream,
         })
+    }
+
+    fn reconnecting_stream<Subscribe, SubscribeFuture>(
+        name: &'static str,
+        backoff: Backoff,
+        replay: GlobalReplayFromSlot,
+        subscribe: Subscribe,
+    ) -> BoxStream<'static, SubscriptionMessage>
+    where
+        Subscribe: Fn(Option<Slot>) -> SubscribeFuture + Send + 'static,
+        SubscribeFuture: Future<Output = Result<kanal::AsyncReceiver<SubscriptionMessage>, SubscribeError>>
+            + Send,
+    {
+        struct State<Subscribe> {
+            backoff: Backoff,
+            replay: GlobalReplayFromSlot,
+            subscribe: Subscribe,
+            stream: Option<(kanal::AsyncReceiver<SubscriptionMessage>, Option<Slot>)>,
+        }
+
+        try_unfold(
+            State {
+                backoff,
+                replay,
+                subscribe,
+                stream: None,
+            },
+            move |mut state| async move {
+                loop {
+                    if let Some((stream, requested)) = state.stream.as_mut() {
+                        match stream.recv().await {
+                            Ok(Ok((name, message))) => {
+                                state.backoff.reset();
+                                return Ok(Some(((name, message), state)));
+                            }
+                            Ok(Err(ReceiveError::ReplayFailed)) => {
+                                if state.replay.report_replay_failed_at(name, *requested) {
+                                    return Err(ReceiveError::ReplayFailed);
+                                }
+                                error!(name, "failed to replay, waiting for other sources");
+                            }
+                            Ok(Err(error)) => {
+                                error!(name, ?error, "failed to receive")
+                            }
+                            Err(_) => {
+                                error!(name, "stream is finished")
+                            }
+                        }
+                        state.stream = None;
+                        state.backoff.sleep().await;
+                    } else {
+                        let requested = state.replay.load();
+                        match (state.subscribe)(requested).await {
+                            Ok(stream) => {
+                                state.stream = Some((stream, requested));
+                            }
+                            Err(error) => {
+                                if error.is_replay_slot_not_available() {
+                                    if state.replay.report_replay_failed_at(name, requested) {
+                                        return Err(ReceiveError::ReplayFailed);
+                                    }
+                                    error!(name, "failed to replay at subscribe time, waiting for other sources");
+                                } else {
+                                    error!(name, ?error, "failed to connect");
+                                }
+                                state.backoff.sleep().await;
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .boxed()
     }
 
     fn get_static_name(name: &str) -> &'static str {
@@ -296,17 +325,16 @@ impl Subscription {
     async fn subscribe(
         name: &'static str,
         config: SubscriptionConfig,
-        disable_accounts: bool,
-        parser: MessageParserEncoding,
-        channel_size: usize,
+        general: &ConfigChannelSourceGeneral,
+        idle_timeout: Option<Duration>,
         replay_from_slot: Option<Slot>,
     ) -> Result<kanal::AsyncReceiver<SubscriptionMessage>, SubscribeError> {
-        let (tx, rx) = kanal::bounded_async(channel_size);
+        let (tx, rx) = kanal::bounded_async(general.channel_size);
 
         let mut stream = match config {
             SubscriptionConfig::Quic { config } => {
                 let connection = config.connect().await.map_err(ConnectError::Quic)?;
-                let filter = Self::create_richat_filter(disable_accounts);
+                let filter = Self::create_richat_filter(general.disable_accounts);
                 match connection.subscribe(replay_from_slot, filter).await {
                     Ok(stream) => {
                         info!(name, version = stream.get_version(), "connected");
@@ -330,7 +358,9 @@ impl Subscription {
                         info!(name, version = version.version, "connected");
                         connection
                             .subscribe_dragons_mouth_once(Self::create_dragons_mouth_filter(
-                                disable_accounts,
+                                general.disable_accounts,
+                                general.block_footer,
+                                general.entry_update_parent,
                                 replay_from_slot,
                             ))
                             .await?
@@ -339,7 +369,7 @@ impl Subscription {
                     ConfigGrpcClientSource::Richat => connection
                         .subscribe_richat(GrpcSubscribeRequest {
                             replay_from_slot,
-                            filter: Self::create_richat_filter(disable_accounts),
+                            filter: Self::create_richat_filter(general.disable_accounts),
                         })
                         .await?
                         .boxed(),
@@ -348,9 +378,22 @@ impl Subscription {
         };
         info!(name, "subscribed");
 
+        let parser = general.parser;
         tokio::spawn(async move {
             loop {
-                let message = match stream.next().await {
+                let next = match idle_timeout {
+                    Some(idle_timeout) => {
+                        match tokio::time::timeout(idle_timeout, stream.next()).await {
+                            Ok(next) => next,
+                            Err(_) => {
+                                let _ = tx.send(Err(ReceiveError::Idle(idle_timeout))).await;
+                                break;
+                            }
+                        }
+                    }
+                    None => stream.next().await,
+                };
+                let message = match next {
                     Some(Ok(data)) => match Message::parse(data.into(), parser) {
                         Ok(message) => Ok((name, message)),
                         Err(MessageParseError::InvalidUpdateMessage("Ping")) => continue,
@@ -388,9 +431,18 @@ impl Subscription {
 
     fn create_dragons_mouth_filter(
         disable_accounts: bool,
+        block_footer: bool,
+        entry_update_parent: bool,
         from_slot: Option<Slot>,
     ) -> SubscribeRequest {
         SubscribeRequest {
+            block_footer: if block_footer {
+                hashmap! { "".to_owned() => SubscribeRequestFilterBlockFooter {
+                    include_certificates: Some(true),
+                } }
+            } else {
+                HashMap::new()
+            },
             accounts: if disable_accounts {
                 HashMap::new()
             } else {
@@ -404,12 +456,13 @@ impl Subscription {
             transactions_status: HashMap::new(),
             blocks: HashMap::new(),
             blocks_meta: hashmap! { "".to_owned() => SubscribeRequestFilterBlocksMeta::default() },
-            entry: hashmap! { "".to_owned() => SubscribeRequestFilterEntry::default() },
+            entry: hashmap! { "".to_owned() => SubscribeRequestFilterEntry {
+                include_update_parent: entry_update_parent.then_some(true),
+            } },
             commitment: Some(CommitmentLevelProto::Processed as i32),
             accounts_data_slice: vec![],
             ping: None,
             from_slot,
-            block_footer: HashMap::new(),
         }
     }
 }
@@ -560,3 +613,6 @@ impl Stream for Subscriptions {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

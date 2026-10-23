@@ -105,61 +105,56 @@ pub fn create_message(message: proto::Message) -> CreateResult<VersionedMessage>
             .map_err(|_| "failed to parse num_readonly_unsigned_accounts")?,
     };
 
-    if message.recent_blockhash.len() != HASH_BYTES {
-        return Err("failed to parse hash");
-    }
+    let hash = Hash::new_from_array(
+        <[u8; HASH_BYTES]>::try_from(message.recent_blockhash.as_slice())
+            .map_err(|_| "failed to parse hash")?,
+    );
 
-    if !message.versioned {
-        return Ok(VersionedMessage::Legacy(Message {
+    Ok(if let Some(config) = message.config {
+        if !message.versioned {
+            return Err("legacy message cannot contain transaction config");
+        }
+        if !message.address_table_lookups.is_empty() {
+            return Err("v1 message cannot contain address table lookups");
+        }
+        VersionedMessage::V1(MessageV1 {
+            header,
+            config: TransactionConfig {
+                priority_fee: config.priority_fee,
+                compute_unit_limit: config.compute_unit_limit,
+                loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit,
+                heap_size: config.heap_size,
+            },
+            lifetime_specifier: hash,
+            account_keys: create_pubkey_vec(message.account_keys)?,
+            instructions: create_message_instructions(message.instructions)?,
+        })
+    } else if message.versioned {
+        let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
+        for table in message.address_table_lookups {
+            address_table_lookups.push(MessageAddressTableLookup {
+                account_key: Pubkey::try_from(table.account_key.as_slice())
+                    .map_err(|_| "failed to parse Pubkey")?,
+                writable_indexes: table.writable_indexes,
+                readonly_indexes: table.readonly_indexes,
+            });
+        }
+
+        VersionedMessage::V0(MessageV0 {
             header,
             account_keys: create_pubkey_vec(message.account_keys)?,
-            recent_blockhash: Hash::new_from_array(
-                <[u8; HASH_BYTES]>::try_from(message.recent_blockhash.as_slice()).unwrap(),
-            ),
+            recent_blockhash: hash,
             instructions: create_message_instructions(message.instructions)?,
-        }));
-    }
-
-    if let Some(config) = message.config {
-        return Ok(VersionedMessage::V1(MessageV1 {
+            address_table_lookups,
+        })
+    } else {
+        VersionedMessage::Legacy(Message {
             header,
-            config: create_transaction_config(config),
-            lifetime_specifier: Hash::new_from_array(
-                <[u8; HASH_BYTES]>::try_from(message.recent_blockhash.as_slice()).unwrap(),
-            ),
             account_keys: create_pubkey_vec(message.account_keys)?,
+            recent_blockhash: hash,
             instructions: create_message_instructions(message.instructions)?,
-        }));
-    }
-
-    let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
-    for table in message.address_table_lookups {
-        address_table_lookups.push(MessageAddressTableLookup {
-            account_key: Pubkey::try_from(table.account_key.as_slice())
-                .map_err(|_| "failed to parse Pubkey")?,
-            writable_indexes: table.writable_indexes,
-            readonly_indexes: table.readonly_indexes,
-        });
-    }
-
-    Ok(VersionedMessage::V0(MessageV0 {
-        header,
-        account_keys: create_pubkey_vec(message.account_keys)?,
-        recent_blockhash: Hash::new_from_array(
-            <[u8; HASH_BYTES]>::try_from(message.recent_blockhash.as_slice()).unwrap(),
-        ),
-        instructions: create_message_instructions(message.instructions)?,
-        address_table_lookups,
-    }))
-}
-
-const fn create_transaction_config(config: proto::TransactionConfig) -> TransactionConfig {
-    TransactionConfig {
-        priority_fee: config.priority_fee,
-        compute_unit_limit: config.compute_unit_limit,
-        loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit,
-        heap_size: config.heap_size,
-    }
+        })
+    })
 }
 
 pub fn create_message_instructions(
@@ -375,4 +370,251 @@ pub fn create_account(
         rent_epoch: account.rent_epoch,
     };
     Ok((pubkey, account))
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        solana_message::v1::{Message as MessageV1, TransactionConfig},
+    };
+
+    type MessageDecoder = fn(proto::Message) -> CreateResult<VersionedMessage>;
+
+    fn decoders() -> [MessageDecoder; 3] {
+        [
+            create_message,
+            decode_transaction_message,
+            decode_transaction_with_meta_message,
+        ]
+    }
+
+    fn decode_transaction_message(message: proto::Message) -> CreateResult<VersionedMessage> {
+        create_tx_versioned(proto::Transaction {
+            signatures: vec![vec![8; 64]],
+            message: Some(message),
+        })
+        .map(|transaction| transaction.message)
+    }
+
+    fn decode_transaction_with_meta_message(
+        message: proto::Message,
+    ) -> CreateResult<VersionedMessage> {
+        let decoded = create_tx_with_meta(proto::SubscribeUpdateTransactionInfo {
+            transaction: Some(proto::Transaction {
+                signatures: vec![vec![8; 64]],
+                message: Some(message),
+            }),
+            meta: Some(proto::TransactionStatusMeta {
+                return_data_none: true,
+                ..proto::TransactionStatusMeta::default()
+            }),
+            ..proto::SubscribeUpdateTransactionInfo::default()
+        })?;
+        let TransactionWithStatusMeta::Complete(decoded) = decoded else {
+            return Err("expected complete transaction");
+        };
+        Ok(decoded.transaction.message)
+    }
+
+    fn wire_message() -> proto::Message {
+        proto::Message {
+            header: Some(proto::MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            }),
+            account_keys: vec![vec![1; 32], vec![2; 32]],
+            recent_blockhash: vec![7; 32],
+            instructions: vec![proto::CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![3, 4],
+            }],
+            versioned: true,
+            address_table_lookups: Vec::new(),
+            config: None,
+        }
+    }
+
+    #[test]
+    fn versioned_config_selects_v1_and_preserves_optional_zero_fields() {
+        for config in [
+            TransactionConfig::default(),
+            TransactionConfig {
+                priority_fee: Some(0),
+                compute_unit_limit: Some(0),
+                loaded_accounts_data_size_limit: Some(0),
+                heap_size: Some(0),
+            },
+            TransactionConfig {
+                priority_fee: Some(u64::MAX),
+                compute_unit_limit: Some(200_000),
+                loaded_accounts_data_size_limit: None,
+                heap_size: Some(65_536),
+            },
+        ] {
+            let mut wire = wire_message();
+            wire.config = Some(proto::TransactionConfig {
+                priority_fee: config.priority_fee,
+                compute_unit_limit: config.compute_unit_limit,
+                loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit,
+                heap_size: config.heap_size,
+            });
+            let expected = VersionedMessage::V1(MessageV1 {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                config,
+                lifetime_specifier: Hash::new_from_array([7; 32]),
+                account_keys: vec![
+                    Pubkey::new_from_array([1; 32]),
+                    Pubkey::new_from_array([2; 32]),
+                ],
+                instructions: vec![CompiledInstruction {
+                    program_id_index: 1,
+                    accounts: vec![0],
+                    data: vec![3, 4],
+                }],
+            });
+            for decode in decoders() {
+                assert_eq!(decode(wire.clone()).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn config_is_rejected_on_legacy_messages() {
+        let mut wire = wire_message();
+        wire.versioned = false;
+        wire.config = Some(proto::TransactionConfig::default());
+        for decode in decoders() {
+            assert!(decode(wire.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn v1_rejects_address_table_lookups() {
+        let mut wire = wire_message();
+        wire.config = Some(proto::TransactionConfig::default());
+        wire.address_table_lookups
+            .push(proto::MessageAddressTableLookup {
+                account_key: vec![9; 32],
+                writable_indexes: vec![1],
+                readonly_indexes: vec![0],
+            });
+        for decode in decoders() {
+            assert!(decode(wire.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_config_preserves_legacy_and_v0_variants() {
+        for decode in decoders() {
+            let mut legacy = wire_message();
+            legacy.versioned = false;
+            let VersionedMessage::Legacy(legacy) = decode(legacy).unwrap() else {
+                panic!("expected legacy message");
+            };
+            assert_eq!(legacy.recent_blockhash, Hash::new_from_array([7; 32]));
+            assert_eq!(legacy.instructions[0].data, vec![3, 4]);
+            let mut v0 = wire_message();
+            v0.address_table_lookups
+                .push(proto::MessageAddressTableLookup {
+                    account_key: vec![9; 32],
+                    writable_indexes: vec![1],
+                    readonly_indexes: vec![0],
+                });
+            let VersionedMessage::V0(v0) = decode(v0).unwrap() else {
+                panic!("expected v0 message");
+            };
+            assert_eq!(v0.recent_blockhash, Hash::new_from_array([7; 32]));
+            assert_eq!(
+                v0.address_table_lookups[0].account_key,
+                Pubkey::new_from_array([9; 32])
+            );
+            assert_eq!(v0.address_table_lookups[0].writable_indexes, vec![1]);
+            assert_eq!(v0.address_table_lookups[0].readonly_indexes, vec![0]);
+        }
+    }
+
+    #[test]
+    fn every_decoder_rejects_malformed_message_fields() {
+        for (versioned, config) in [
+            (false, None),
+            (true, None),
+            (true, Some(proto::TransactionConfig::default())),
+        ] {
+            let mut valid = wire_message();
+            valid.versioned = versioned;
+            valid.config = config;
+            let mut malformed = Vec::new();
+            let mut wire = valid.clone();
+            wire.header = None;
+            malformed.push(wire);
+            for header_field in 0..3 {
+                let mut wire = valid.clone();
+                let header = wire.header.as_mut().unwrap();
+                match header_field {
+                    0 => header.num_required_signatures = 256,
+                    1 => header.num_readonly_signed_accounts = 256,
+                    _ => header.num_readonly_unsigned_accounts = 256,
+                }
+                malformed.push(wire);
+            }
+            for length in [31, 33] {
+                let mut wire = valid.clone();
+                wire.recent_blockhash = vec![7; length];
+                malformed.push(wire);
+            }
+            let mut wire = valid.clone();
+            wire.account_keys[0].pop();
+            malformed.push(wire);
+            let mut wire = valid;
+            wire.instructions[0].program_id_index = 256;
+            malformed.push(wire);
+            for wire in malformed {
+                for decode in decoders() {
+                    assert!(
+                        decode(wire.clone()).is_err(),
+                        "accepted malformed message: {wire:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transaction_decoders_preserve_v1_messages() {
+        let mut message = wire_message();
+        message.config = Some(proto::TransactionConfig {
+            priority_fee: Some(0),
+            ..proto::TransactionConfig::default()
+        });
+        let transaction = proto::Transaction {
+            signatures: vec![vec![8; 64]],
+            message: Some(message),
+        };
+        let decoded = create_tx_versioned(transaction.clone()).unwrap();
+        assert!(matches!(decoded.message, VersionedMessage::V1(_)));
+        let decoded = create_tx_with_meta(proto::SubscribeUpdateTransactionInfo {
+            transaction: Some(transaction),
+            meta: Some(proto::TransactionStatusMeta {
+                return_data_none: true,
+                ..proto::TransactionStatusMeta::default()
+            }),
+            ..proto::SubscribeUpdateTransactionInfo::default()
+        })
+        .unwrap();
+        let TransactionWithStatusMeta::Complete(decoded) = decoded else {
+            panic!("expected complete transaction")
+        };
+        let VersionedMessage::V1(message) = decoded.transaction.message else {
+            panic!("expected v1 transaction")
+        };
+        assert_eq!(message.config.priority_fee, Some(0));
+        assert_eq!(message.lifetime_specifier, Hash::new_from_array([7; 32]));
+    }
 }

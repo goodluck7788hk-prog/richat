@@ -38,6 +38,54 @@ type EntryFilterMap = HashMap<String, SubscribeRequestFilterEntry>;
 type BlocksFilterMap = HashMap<String, SubscribeRequestFilterBlocks>;
 type BlocksMetaFilterMap = HashMap<String, SubscribeRequestFilterBlocksMeta>;
 
+#[cfg(test)]
+mod tests {
+    use {super::ActionSubscribe, clap::Parser};
+
+    #[derive(Parser)]
+    struct SubscribeArgs {
+        #[command(flatten)]
+        subscribe: ActionSubscribe,
+    }
+
+    #[tokio::test]
+    async fn alpenglow_flags_build_matching_subscription_filters() {
+        let args = SubscribeArgs::try_parse_from([
+            "test",
+            "--entries",
+            "--entries-include-update-parent",
+            "--block-footer",
+            "--block-footer-include-certificates",
+            "true",
+        ])
+        .unwrap();
+        let (request, _, _) = args
+            .subscribe
+            .get_subscribe_request(None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.entry["client"].include_update_parent, Some(true));
+        assert_eq!(
+            request.block_footer["client"].include_certificates,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn alpenglow_notifications_remain_opt_in() {
+        let args = SubscribeArgs::try_parse_from(["test", "--entries"]).unwrap();
+        let (request, _, _) = args
+            .subscribe
+            .get_subscribe_request(None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(request.entry["client"].include_update_parent, Some(true));
+        assert!(request.block_footer.is_empty());
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct ArgsAppStreamGrpc {
     #[clap(short, long, default_value_t = String::from("http://127.0.0.1:10000"))]
@@ -385,8 +433,7 @@ struct ActionSubscribe {
     #[clap(long)]
     entries: bool,
 
-    /// Include Alpenglow entry update parent markers with entries
-    #[clap(long)]
+    #[clap(long, help = "Include Alpenglow entry parent updates")]
     entries_include_update_parent: bool,
 
     /// Subscribe on block updates
@@ -413,12 +460,10 @@ struct ActionSubscribe {
     #[clap(long)]
     blocks_meta: bool,
 
-    /// Subscribe on Alpenglow block footer updates
-    #[clap(long)]
+    #[clap(long, help = "Subscribe to Alpenglow block footers")]
     block_footer: bool,
 
-    /// Include certificates to block footer message
-    #[clap(long)]
+    #[clap(long, help = "Include typed certificates in block footers")]
     block_footer_include_certificates: Option<bool>,
 
     /// Re-send message from slot
@@ -544,6 +589,8 @@ impl ActionSubscribe {
                     account_include: self.transactions_account_include,
                     account_exclude: self.transactions_account_exclude,
                     account_required: self.transactions_account_required,
+                    // yellowstone-grpc-proto 12.7.0 新增：可选的 cuckoo filter 形式的 account_include
+                    // （用于超大地址集合的紧凑匹配）。我们走普通 account_include，置 None。
                     cuckoo_account_include: None,
                     token_accounts: None,
                 },
@@ -561,6 +608,8 @@ impl ActionSubscribe {
                     account_include: self.transactions_status_account_include,
                     account_exclude: self.transactions_status_account_exclude,
                     account_required: self.transactions_status_account_required,
+                    // yellowstone-grpc-proto 12.7.0 新增：可选的 cuckoo filter 形式的 account_include
+                    // （用于超大地址集合的紧凑匹配）。我们走普通 account_include，置 None。
                     cuckoo_account_include: None,
                     token_accounts: None,
                 },

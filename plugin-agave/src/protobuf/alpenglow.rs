@@ -1,10 +1,3 @@
-//! Converts Alpenglow block footers and entry-update-parent markers to protobuf.
-//!
-//! Unlike accounts/transactions (thousands per second, need the zero-copy `raw`
-//! encoder), these arrive about once per block and are small, so we always build a
-//! normal `prost` struct and encode it, no matter which encoder is configured.
-//! The output bytes are the same either way.
-
 use {
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         ReplicaBlockFooterInfo, ReplicaEntryUpdateParentInfo,
@@ -29,7 +22,6 @@ fn aggregate(signature: &[u8], block_id: &[u8], bitmap: &[u8]) -> BlockFooterVot
     }
 }
 
-// `VotesAggregate` exposes its signature only uncompressed, so compress it back to 96 bytes.
 fn votes_aggregate(
     value: &VotesAggregate,
     block_id: &[u8],
@@ -42,8 +34,6 @@ fn votes_aggregate(
     ))
 }
 
-// Slow finalization: `final_aggregate` votes on the slot (no block id), `notar_aggregate` on the
-// block. Fast finalization: `final_aggregate` alone, on the block.
 fn block_final_cert(cert: &BlockFinalizationCert) -> Result<BlockFooterFinalCert, BlsError> {
     let block_id = cert.block_id.as_ref();
     let (final_aggregate, notar_aggregate) = match &cert.notar_aggregate {
@@ -66,7 +56,6 @@ pub fn create_block_footer(
 ) -> SubscribeUpdateBlockFooter {
     let VersionedBlockFooter::V1(footer) = info.block_footer;
 
-    // A final cert with an invalid signature is dropped, so the rest of the footer still goes out.
     let block_final_cert = footer.block_final_cert.as_ref().and_then(|cert| {
         block_final_cert(cert)
             .inspect_err(|error| warn!("slot {}: invalid block final cert: {error}", info.slot))

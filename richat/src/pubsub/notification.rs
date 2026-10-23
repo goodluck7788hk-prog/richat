@@ -18,9 +18,7 @@ use {
         TransactionDetails, TransactionStatusMeta, UiAccountsList, UiConfirmedBlock,
         UiTransactionEncoding, UiTransactionStatusMeta, VersionedTransactionWithStatusMeta,
         option_serializer::OptionSerializer,
-        parse_accounts::{
-            parse_legacy_message_accounts, parse_v0_message_accounts, parse_v1_message_accounts,
-        },
+        parse_accounts::{parse_legacy_message_accounts, parse_v0_message_accounts},
     },
     std::{
         collections::VecDeque,
@@ -288,7 +286,9 @@ impl RpcTransactionUpdate {
                 );
                 parse_v0_message_accounts(&loaded_message)
             }
-            VersionedMessage::V1(message) => parse_v1_message_accounts(message),
+            VersionedMessage::V1(_) => {
+                return Err(RpcTransactionUpdateError::UnsupportedTransactionVersion(1));
+            }
         };
 
         Ok(EncodedTransactionWithStatusMeta {

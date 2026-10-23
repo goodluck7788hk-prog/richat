@@ -136,6 +136,7 @@ pub async fn handle_stream(
                 let mut value = create_pretty_account(account)?;
                 value["isStartup"] = json!(msg.is_startup);
                 value["slot"] = json!(msg.slot);
+                value["bankId"] = json!(msg.bank_id);
                 print_update("account", created_at, &filters, value);
             }
             Some(UpdateOneof::Slot(msg)) => {
@@ -150,6 +151,7 @@ pub async fn handle_stream(
                         "parent": msg.parent,
                         "status": status.as_str_name(),
                         "deadError": msg.dead_error,
+                        "bankId": msg.bank_id,
                     }),
                 );
             }
@@ -159,6 +161,7 @@ pub async fn handle_stream(
                     .ok_or(anyhow::anyhow!("no transaction in the message"))?;
                 let mut value = create_pretty_transaction(tx)?;
                 value["slot"] = json!(msg.slot);
+                value["bankId"] = json!(msg.bank_id);
                 print_update("transaction", created_at, &filters, value);
             }
             Some(UpdateOneof::TransactionStatus(msg)) => {
@@ -169,6 +172,7 @@ pub async fn handle_stream(
                     json!({
                         "slot": msg.slot,
                         "signature": Signature::try_from(msg.signature.as_slice()).context("invalid signature")?.to_string(),
+                        "bankId": msg.bank_id,
                         "isVote": msg.is_vote,
                         "index": msg.index,
                         "err": convert_from::create_tx_error(msg.err.as_ref())
@@ -300,6 +304,7 @@ fn create_pretty_transaction(tx: SubscribeUpdateTransactionInfo) -> anyhow::Resu
 fn create_pretty_entry(msg: SubscribeUpdateEntry) -> anyhow::Result<Value> {
     Ok(json!({
         "slot": msg.slot,
+        "bankId": msg.bank_id,
         "index": msg.index,
         "numHashes": msg.num_hashes,
         "hash": Hash::new_from_array(<[u8; 32]>::try_from(msg.hash.as_slice()).context("invalid entry hash")?).to_string(),
@@ -308,9 +313,39 @@ fn create_pretty_entry(msg: SubscribeUpdateEntry) -> anyhow::Result<Value> {
     }))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pretty_block_entry_and_meta_include_bank_id() {
+        let bank_id = 123_456_789;
+        let entry = create_pretty_entry(SubscribeUpdateEntry {
+            bank_id,
+            hash: vec![1; 32],
+            ..Default::default()
+        })
+        .unwrap();
+        let meta = create_pretty_blockmeta(SubscribeUpdateBlockMeta {
+            bank_id,
+            ..Default::default()
+        })
+        .unwrap();
+        let block = create_pretty_block(SubscribeUpdateBlock {
+            bank_id,
+            ..Default::default()
+        })
+        .unwrap();
+        for pretty in [entry, meta, block] {
+            assert_eq!(pretty["bankId"], bank_id);
+        }
+    }
+}
+
 fn create_pretty_blockmeta(msg: SubscribeUpdateBlockMeta) -> anyhow::Result<Value> {
     Ok(json!({
         "slot": msg.slot,
+        "bankId": msg.bank_id,
         "blockhash": msg.blockhash,
         "rewards": if let Some(rewards) = msg.rewards {
             Some(convert_from::create_rewards_obj(rewards).map_err(|error| anyhow::anyhow!(error))?)
@@ -329,6 +364,7 @@ fn create_pretty_blockmeta(msg: SubscribeUpdateBlockMeta) -> anyhow::Result<Valu
 fn create_pretty_block(msg: SubscribeUpdateBlock) -> anyhow::Result<Value> {
     Ok(json!({
         "slot": msg.slot,
+        "bankId": msg.bank_id,
         "blockhash": msg.blockhash,
         "rewards": if let Some(rewards) = msg.rewards {
             Some(convert_from::create_rewards_obj(rewards).map_err(|error| anyhow::anyhow!(error))?)

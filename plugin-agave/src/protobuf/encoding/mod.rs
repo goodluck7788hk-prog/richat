@@ -152,3 +152,54 @@ pub fn bytes_encode(tag: u32, value: &[u8], buf: &mut impl BufMut) {
 pub const fn bytes_encoded_len(tag: u32, value: &[u8]) -> usize {
     key_len(tag) + encoded_len_varint(value.len() as u64) + value.len()
 }
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{RewardWrapper, reward_type_as_i32},
+        prost::Message as _,
+        richat_proto::{convert_from, convert_to, solana::storage::confirmed_block as proto},
+        solana_transaction_status::{Reward, RewardType},
+    };
+
+    #[test]
+    fn reward_raw_prost_and_from_proto_preserve_all_enum_values() {
+        for (reward_type, schema_type, expected_number) in [
+            (None, proto::RewardType::Unspecified, 0),
+            (Some(RewardType::Fee), proto::RewardType::Fee, 1),
+            (Some(RewardType::Rent), proto::RewardType::Rent, 2),
+            (Some(RewardType::Staking), proto::RewardType::Staking, 3),
+            (Some(RewardType::Voting), proto::RewardType::Voting, 4),
+            (
+                Some(RewardType::DeactivatedStake),
+                proto::RewardType::DeactivatedStake,
+                5,
+            ),
+            (Some(RewardType::VATDebit), proto::RewardType::VatDebit, 6),
+        ] {
+            assert_eq!(schema_type as i32, expected_number);
+            assert_eq!(reward_type_as_i32(reward_type), expected_number);
+            let reward = Reward {
+                pubkey: "11111111111111111111111111111111".to_owned(),
+                lamports: -17,
+                post_balance: 42,
+                reward_type,
+                commission: Some(0),
+                commission_bps: None,
+            };
+            let raw_reward = &RewardWrapper::new(std::slice::from_ref(&reward))[0];
+            let raw_bytes = raw_reward.encode_to_vec();
+            assert_eq!(raw_bytes.len(), raw_reward.encoded_len());
+            let prost_reward = convert_to::create_reward(&reward);
+            assert_eq!(prost_reward.reward_type, expected_number);
+            assert_eq!(raw_bytes, prost_reward.encode_to_vec());
+            let decoded_raw = proto::Reward::decode(raw_bytes.as_slice()).unwrap();
+            assert_eq!(decoded_raw, prost_reward);
+            for encoded in [decoded_raw, prost_reward.clone()] {
+                let decoded = convert_from::create_reward(encoded).unwrap();
+                assert_eq!(decoded.reward_type, reward_type);
+                assert_eq!(convert_to::create_reward(&decoded), prost_reward);
+            }
+        }
+    }
+}

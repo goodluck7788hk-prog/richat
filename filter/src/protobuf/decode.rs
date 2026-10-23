@@ -84,9 +84,9 @@ impl LimitedDecode for SubscribeUpdateLimitedDecode {
         buf_len: usize,
     ) -> Result<(), DecodeError> {
         const STRUCT_NAME: &str = "SubscribeUpdateLimitedDecode";
-        check_wire_type(WireType::LengthDelimited, wire_type)?;
         match tag {
             1u32 => {
+                check_wire_type(WireType::LengthDelimited, wire_type)?;
                 let len = decode_varint(buf)? as usize;
                 if len > buf.remaining() {
                     return Err(decode_error(
@@ -99,6 +99,7 @@ impl LimitedDecode for SubscribeUpdateLimitedDecode {
             }
             #[allow(clippy::manual_range_patterns)]
             2u32 | 3u32 | 4u32 | 10u32 | 5u32 | 6u32 | 9u32 | 7u32 | 8u32 | 12u32 | 13u32 => {
+                check_wire_type(WireType::LengthDelimited, wire_type)?;
                 let value = &mut self.update_oneof;
                 UpdateOneofLimitedDecode::merge(value, tag, buf, buf_len).map_err(|mut error| {
                     error.push(STRUCT_NAME, "update_oneof");
@@ -106,6 +107,7 @@ impl LimitedDecode for SubscribeUpdateLimitedDecode {
                 })
             }
             11u32 => {
+                check_wire_type(WireType::LengthDelimited, wire_type)?;
                 let value = &mut self.created_at;
                 encoding::message::merge(
                     WireType::LengthDelimited,
@@ -118,12 +120,7 @@ impl LimitedDecode for SubscribeUpdateLimitedDecode {
                     error
                 })
             }
-            _ => encoding::skip_field(
-                WireType::LengthDelimited,
-                tag,
-                buf,
-                DecodeContext::default(),
-            ),
+            _ => encoding::skip_field(wire_type, tag, buf, DecodeContext::default()),
         }
     }
 }
@@ -437,6 +434,7 @@ pub struct UpdateOneofLimitedDecodeSlot {
     pub parent: Option<Slot>,
     pub status: i32,
     pub dead_error: Option<Range<usize>>,
+    pub bank_id: Option<u64>,
 }
 
 impl LimitedDecode for UpdateOneofLimitedDecodeSlot {
@@ -492,6 +490,13 @@ impl LimitedDecode for UpdateOneofLimitedDecodeSlot {
                 let end = buf_len - buf.remaining();
                 self.dead_error = Some(Range { start, end });
                 Ok(())
+            }
+            5u32 => {
+                let value = self.bank_id.get_or_insert_default();
+                encoding::uint64::merge(wire_type, value, buf, ctx).map_err(|mut error| {
+                    error.push(STRUCT_NAME, "bank_id");
+                    error
+                })
             }
             _ => encoding::skip_field(wire_type, tag, buf, ctx),
         }
@@ -736,6 +741,7 @@ pub struct UpdateOneofLimitedDecodeEntry {
     pub slot: Slot,
     pub index: u64,
     pub executed_transaction_count: u64,
+    pub bank_id: u64,
 }
 
 impl LimitedDecode for UpdateOneofLimitedDecodeEntry {
@@ -792,6 +798,12 @@ impl LimitedDecode for UpdateOneofLimitedDecodeEntry {
                 error.push(STRUCT_NAME, "starting_transaction_index");
                 error
             }),
+            7u32 => encoding::uint64::merge(wire_type, &mut self.bank_id, buf, ctx).map_err(
+                |mut error| {
+                    error.push(STRUCT_NAME, "bank_id");
+                    error
+                },
+            ),
             _ => encoding::skip_field(wire_type, tag, buf, ctx),
         }
     }

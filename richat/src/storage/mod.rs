@@ -37,10 +37,11 @@ use {
 
 /// Replay start metadata exposed to the rest of `richat` for each retained
 /// slot.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SlotIndexValue {
     pub finalized: bool,
     pub head: u64,
+    pub source: Option<Arc<str>>,
 }
 
 /// Public storage facade used by channel startup, replay bootstrap, and disk
@@ -250,19 +251,34 @@ impl Storage {
         index: u64,
         message: ParsedMessage,
     ) {
-        let _ = self.write_tx.send(WriterCommand::PushMessage {
-            init,
-            slot,
-            head,
-            index,
-            message,
-        });
+        let _ = self.push_message_with_source(init, slot, head, index, message, None);
     }
 
     pub fn trim_messages(&self, slot: Slot, until: Option<u64>) {
         let _ = self
             .write_tx
             .send(WriterCommand::RemoveReplay { slot, until });
+    }
+
+    pub fn push_message_with_source(
+        &self,
+        init: bool,
+        slot: Slot,
+        head: u64,
+        index: u64,
+        message: ParsedMessage,
+        source: Option<Arc<str>>,
+    ) -> anyhow::Result<()> {
+        self.write_tx
+            .send(WriterCommand::PushMessage {
+                init,
+                slot,
+                head,
+                index,
+                message,
+                source,
+            })
+            .context("failed to enqueue storage message")
     }
 
     pub fn read_slots(&self) -> BTreeMap<Slot, SlotIndexValue> {
@@ -276,6 +292,7 @@ impl Storage {
                     SlotIndexValue {
                         finalized: meta.finalized,
                         head: meta.first_index,
+                        source: meta.source.clone(),
                     },
                 )
             })
@@ -436,5 +453,66 @@ impl ReplayQueue {
         locked.capacity = 0;
         locked.len = 0;
         locked.requests.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        prost::Message as _,
+        richat_filter::message::Message,
+        richat_proto::geyser::{
+            SlotStatus, SubscribeUpdate, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        },
+        std::time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn checked_send_reports_a_closed_writer_queue() -> anyhow::Result<()> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "richat-closed-writer-{}-{nonce}",
+            std::process::id()
+        ));
+        let metadata = Metadata::open(&directory.join("metadata"), directory.join("segments"))?;
+        let (write_tx, write_rx) = kanal::bounded(1);
+        let storage = Storage {
+            metadata,
+            write_tx,
+            replay_queue: Arc::new(Mutex::new(ReplayQueue::new(0))),
+            metric_disk_size_poll_interval: Duration::from_secs(1),
+        };
+        let update = SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot: 100,
+                status: SlotStatus::SlotCreatedBank as i32,
+                ..Default::default()
+            })),
+            created_at: Some(Default::default()),
+            ..Default::default()
+        };
+        let message: ParsedMessage =
+            Message::parse(update.encode_to_vec().into(), MessageParserEncoding::Prost)?.into();
+        drop(write_rx);
+        let result = storage.push_message_with_source(
+            true,
+            100,
+            1,
+            1,
+            message.clone(),
+            Some(Arc::from("one")),
+        );
+        storage.push_message(true, 100, 1, 1, message);
+        drop(storage);
+        std::fs::remove_dir_all(directory)?;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<kanal::SendError>()
+                .is_some()
+        );
+        Ok(())
     }
 }

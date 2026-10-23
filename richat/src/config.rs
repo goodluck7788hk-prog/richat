@@ -1,6 +1,6 @@
 use {
     crate::{
-        grpc::config::ConfigAppsGrpc, pubsub::config::ConfigAppsPubsub,
+        channel::DedupMode, grpc::config::ConfigAppsGrpc, pubsub::config::ConfigAppsPubsub,
         richat::config::ConfigAppsRichat, storage::segments::ChunkCompression,
     },
     futures::future::{TryFutureExt, ready, try_join_all},
@@ -49,6 +49,19 @@ pub struct ConfigChannel {
 }
 
 impl ConfigChannel {
+    pub fn dedup_mode(&self) -> DedupMode {
+        if self.sources_sighup_reload || self.sources.len() > 1 {
+            DedupMode::MultiSource
+        } else if self.sources.iter().any(|source| match source {
+            ConfigChannelSource::Quic { general, .. }
+            | ConfigChannelSource::Grpc { general, .. } => general.reconnect.is_some(),
+        }) {
+            DedupMode::SingleSource
+        } else {
+            DedupMode::Disabled
+        }
+    }
+
     pub fn get_messages_parser(&self) -> MessageParserEncoding {
         if let Some(source) = self.sources.first() {
             return match source {
@@ -159,6 +172,10 @@ pub struct ConfigChannelSourceGeneral {
     #[serde(default)]
     pub disable_accounts: bool,
     #[serde(default)]
+    pub block_footer: bool,
+    #[serde(default)]
+    pub entry_update_parent: bool,
+    #[serde(default)]
     pub exclude_on_finish: bool,
     #[serde(default)]
     pub reconnect: Option<ConfigChannelSourceReconnect>,
@@ -174,6 +191,8 @@ impl ConfigChannelSourceGeneral {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ConfigChannelSourceReconnect {
+    #[serde(default, with = "humantime_serde")]
+    pub idle_timeout: Option<Duration>,
     #[serde(
         with = "humantime_serde",
         default = "ConfigChannelSourceReconnect::default_initial_interval"

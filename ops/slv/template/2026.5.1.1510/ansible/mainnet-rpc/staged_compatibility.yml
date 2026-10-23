@@ -1,0 +1,9 @@
+---
+staged_agave_toolchains:
+  '4.3.0': '1.97.1'
+  '4.3.2': '1.97.1'
+staged_quinn_proto_min_version: '0.11.18'
+staged_richat_label_version: >-
+  {{ (richat_version_resolved | regex_findall('agave([0-9]+[.][0-9]+(?:[.][0-9]+)?)(?:$|[-+])') | first) | default('') }}
+staged_richat_expected_agave: >-
+  {{ staged_richat_label_version ~ ('.0' if staged_richat_label_version.split('.') | length == 2 else '') }}

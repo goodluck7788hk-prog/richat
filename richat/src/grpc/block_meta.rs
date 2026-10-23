@@ -5,7 +5,11 @@ use {
     futures::future::TryFutureExt,
     richat_proto::geyser::{CommitmentLevel as CommitmentLevelProto, SlotStatus},
     solana_clock::{MAX_PROCESSING_AGE, Slot},
-    std::{collections::HashMap, future::Future, sync::Arc},
+    std::{
+        collections::{HashMap, HashSet},
+        future::Future,
+        sync::Arc,
+    },
     tokio::sync::oneshot,
     tonic::Status,
 };
@@ -16,9 +20,28 @@ pub struct BlockMeta {
     pub blockhash: Arc<String>,
     pub block_height: Slot,
 
-    processed: bool, // flag, means that we received block meta message
+    bank_id: u64,
+}
+
+#[derive(Debug, Default)]
+struct SlotCandidates {
+    candidates: Vec<BlockMeta>,
+    selected_bank_id: Option<u64>,
+    cleared_banks: HashSet<u64, RandomState>,
     confirmed: bool,
     finalized: bool,
+}
+
+impl SlotCandidates {
+    fn selected(&self) -> Option<&BlockMeta> {
+        if (self.confirmed || self.finalized) && self.selected_bank_id.is_none() {
+            return None;
+        }
+        self.candidates.iter().rev().find(|candidate| {
+            self.selected_bank_id
+                .is_none_or(|bank_id| candidate.bank_id == bank_id)
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -54,79 +77,29 @@ impl BlockMetaStorage {
         messages_rx: kanal::AsyncReceiver<ParsedMessage>,
         requests_rx: kanal::AsyncReceiver<Request>,
     ) {
-        let mut blocks = HashMap::<Slot, BlockMeta, RandomState>::default();
-        let mut blockhashes = HashMap::<Arc<String>, BlockStatus, RandomState>::default();
-        let mut processed = 0;
-        let mut confirmed = 0;
-        let mut finalized = 0;
-
+        let mut state = State::default();
+        let messages = messages_rx.recv();
+        let requests = requests_rx.recv();
+        tokio::pin!(messages, requests);
         loop {
             tokio::select! {
                 biased;
-                message = messages_rx.recv() => match message {
-                    Ok(ParsedMessage::Slot(msg)) => {
-                        let slot = msg.slot();
-                        let status = msg.status();
-                        if status == SlotStatus::SlotConfirmed {
-                            let entry = blocks.entry(slot).or_default();
-                            entry.confirmed = true;
-                            blockhashes.entry(Arc::clone(&entry.blockhash)).or_default().confirmed = true;
-                            confirmed = slot;
-                            gauge!(metrics::GRPC_BLOCK_META_SLOT, "commitment" => "confirmed").set(slot as f64);
-                        } else if status == SlotStatus::SlotFinalized {
-                            let entry = blocks.entry(slot).or_default();
-                            entry.finalized = true;
-                            blockhashes.entry(Arc::clone(&entry.blockhash)).or_default().finalized = true;
-                            finalized = slot;
-                            gauge!(metrics::GRPC_BLOCK_META_SLOT, "commitment" => "finalized").set(slot as f64);
-
-                            // cleanup
-                            blockhashes.retain(|_blockhash, bentry| bentry.last_valid_block_height < entry.block_height);
-                            blocks.retain(|bslot, _block| *bslot >= slot);
-                        }
+                message = &mut messages => {
+                    messages.set(messages_rx.recv());
+                    match message {
+                        Ok(message) => state.handle_message(message),
+                        Err(_) => break,
                     }
-                    Ok(ParsedMessage::BlockMeta(msg)) => {
-                        let slot = msg.slot();
-                        let entry = blocks.entry(slot).or_default();
-                        entry.slot = slot;
-                        entry.blockhash = Arc::new(msg.blockhash().to_owned());
-                        entry.block_height = msg.block_height();
-                        entry.processed = true;
-                        let bentry = blockhashes.entry(Arc::clone(&entry.blockhash)).or_default();
-                        bentry.last_valid_block_height = entry.block_height + MAX_PROCESSING_AGE as u64;
-                        bentry.processed = true;
-                        processed = processed.max(slot);
-                        gauge!(metrics::GRPC_BLOCK_META_SLOT, "commitment" => "processed").set(slot as f64);
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
                 },
-                request = requests_rx.recv() => {
+                request = &mut requests => {
+                    requests.set(requests_rx.recv());
                     gauge!(metrics::GRPC_BLOCK_META_QUEUE_SIZE).decrement(1);
                     match request {
                         Ok(Request::GetBlock(tx, commitment)) => {
-                            let slot = match commitment {
-                                CommitmentLevelProto::Processed => processed,
-                                CommitmentLevelProto::Confirmed => confirmed,
-                                CommitmentLevelProto::Finalized => finalized,
-                            };
-                            let block = blocks.get(&slot).cloned();
-                            let _ = tx.send(block);
+                            let _ = tx.send(state.get_block(commitment));
                         }
                         Ok(Request::IsBlockhashValid(tx, blockhash, commitment)) => {
-                            let slot = match commitment {
-                                CommitmentLevelProto::Processed => processed,
-                                CommitmentLevelProto::Confirmed => confirmed,
-                                CommitmentLevelProto::Finalized => finalized,
-                            };
-                            let block = blocks.get(&slot).cloned();
-                            let value = if let (Some(block), Some(entry)) = (block, blockhashes.get(&blockhash)) {
-                                let valid = block.block_height < entry.last_valid_block_height;
-                                Some((valid, block.slot))
-                            } else {
-                                None
-                            };
-                            let _ = tx.send(value);
+                            let _ = tx.send(state.is_blockhash_valid(&blockhash, commitment));
                         }
                         Err(_) => break,
                     }
@@ -181,3 +154,190 @@ enum Request {
         CommitmentLevelProto,
     ),
 }
+
+#[derive(Debug, Default)]
+struct State {
+    blocks: HashMap<Slot, SlotCandidates, RandomState>,
+    blockhashes: HashMap<Arc<String>, BlockStatus, RandomState>,
+    processed: Slot,
+    confirmed: Slot,
+    finalized: Slot,
+}
+
+impl State {
+    fn handle_message(&mut self, message: ParsedMessage) {
+        let slot = message.slot();
+        if slot < self.finalized {
+            return;
+        }
+        match message {
+            ParsedMessage::Slot(message) => {
+                let status = message.status();
+                if !matches!(
+                    status,
+                    SlotStatus::SlotConfirmed | SlotStatus::SlotFinalized
+                ) {
+                    return;
+                }
+                let entry = self.blocks.entry(slot).or_default();
+                if status == SlotStatus::SlotFinalized
+                    || !entry.confirmed
+                    || (entry.selected_bank_id.is_none() && message.bank_id().is_some())
+                {
+                    entry.selected_bank_id =
+                        message.bank_id().or(entry.selected_bank_id).or_else(|| {
+                            (entry.candidates.len() == 1).then(|| entry.candidates[0].bank_id)
+                        });
+                }
+                if status == SlotStatus::SlotConfirmed {
+                    entry.confirmed = true;
+                    self.confirmed = self.confirmed.max(slot);
+                    gauge!(metrics::GRPC_BLOCK_META_SLOT, "commitment" => "confirmed")
+                        .set(self.confirmed as f64);
+                } else {
+                    entry.confirmed = true;
+                    entry.finalized = true;
+                    self.finalized = self.finalized.max(slot);
+                    self.confirmed = self.confirmed.max(slot);
+                    gauge!(metrics::GRPC_BLOCK_META_SLOT, "commitment" => "finalized")
+                        .set(self.finalized as f64);
+                }
+                self.update_hash_statuses(slot);
+                self.prune();
+            }
+            ParsedMessage::BlockMeta(message) => {
+                let bank_id = message.bank_id();
+                let entry = self.blocks.entry(slot).or_default();
+                if entry.cleared_banks.contains(&bank_id)
+                    || (entry.finalized
+                        && entry
+                            .selected_bank_id
+                            .is_some_and(|selected| selected != bank_id))
+                {
+                    return;
+                }
+                let candidate = BlockMeta {
+                    slot,
+                    bank_id,
+                    blockhash: Arc::new(message.blockhash().to_owned()),
+                    block_height: message.block_height(),
+                };
+                self.blockhashes
+                    .entry(Arc::clone(&candidate.blockhash))
+                    .or_default()
+                    .last_valid_block_height = candidate.block_height + MAX_PROCESSING_AGE as u64;
+                if let Some(previous) = entry
+                    .candidates
+                    .iter_mut()
+                    .find(|previous| previous.bank_id == bank_id)
+                {
+                    *previous = candidate;
+                } else {
+                    entry.candidates.push(candidate);
+                }
+                if (entry.confirmed || entry.finalized)
+                    && entry.selected_bank_id.is_none()
+                    && entry.candidates.len() == 1
+                {
+                    entry.selected_bank_id = Some(bank_id);
+                }
+                self.processed = self.processed.max(slot);
+                gauge!(metrics::GRPC_BLOCK_META_SLOT, "commitment" => "processed")
+                    .set(self.processed as f64);
+                self.update_hash_statuses(slot);
+                self.prune();
+            }
+            ParsedMessage::EntryUpdateParent(message) => {
+                let bank_id = message.cleared_bank_id();
+                let entry = self.blocks.entry(slot).or_default();
+                if (entry.confirmed || entry.finalized) && entry.selected_bank_id == Some(bank_id) {
+                    return;
+                }
+                entry.cleared_banks.insert(bank_id);
+                for candidate in entry
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.bank_id == bank_id)
+                {
+                    if let Some(status) = self.blockhashes.get_mut(&candidate.blockhash) {
+                        status.processed = false;
+                        status.confirmed = false;
+                        status.finalized = false;
+                    }
+                }
+                entry
+                    .candidates
+                    .retain(|candidate| candidate.bank_id != bank_id);
+                self.update_hash_statuses(slot);
+            }
+            _ => {}
+        }
+    }
+
+    fn update_hash_statuses(&mut self, slot: Slot) {
+        let entry = &self.blocks[&slot];
+        for candidate in &entry.candidates {
+            if let Some(status) = self.blockhashes.get_mut(&candidate.blockhash) {
+                status.processed = false;
+                status.confirmed = false;
+                status.finalized = false;
+            }
+        }
+        for candidate in entry.candidates.iter().filter(|candidate| {
+            entry
+                .selected_bank_id
+                .is_none_or(|selected| selected == candidate.bank_id)
+        }) {
+            if let Some(status) = self.blockhashes.get_mut(&candidate.blockhash) {
+                status.processed = true;
+                status.confirmed = entry.confirmed && entry.selected_bank_id.is_some();
+                status.finalized = entry.finalized && entry.selected_bank_id.is_some();
+            }
+        }
+    }
+
+    fn prune(&mut self) {
+        if let Some(block) = self
+            .blocks
+            .get(&self.finalized)
+            .and_then(SlotCandidates::selected)
+        {
+            let block_height = block.block_height;
+            self.blockhashes
+                .retain(|_, status| status.last_valid_block_height >= block_height);
+            self.blocks.retain(|slot, _| *slot >= self.finalized);
+        }
+    }
+
+    fn get_block(&self, commitment: CommitmentLevelProto) -> Option<BlockMeta> {
+        let slot = match commitment {
+            CommitmentLevelProto::Processed => self.processed,
+            CommitmentLevelProto::Confirmed => self.confirmed,
+            CommitmentLevelProto::Finalized => self.finalized,
+        };
+        self.blocks.get(&slot)?.selected().cloned()
+    }
+
+    fn is_blockhash_valid(
+        &self,
+        blockhash: &str,
+        commitment: CommitmentLevelProto,
+    ) -> Option<(bool, Slot)> {
+        let block = self.get_block(commitment)?;
+        let valid = self
+            .blockhashes
+            .get(&blockhash.to_owned())
+            .is_some_and(|status| {
+                let accepted = match commitment {
+                    CommitmentLevelProto::Processed => status.processed,
+                    CommitmentLevelProto::Confirmed => status.confirmed,
+                    CommitmentLevelProto::Finalized => status.finalized,
+                };
+                accepted && block.block_height <= status.last_valid_block_height
+            });
+        Some((valid, block.slot))
+    }
+}
+
+#[cfg(test)]
+mod stability_tests;

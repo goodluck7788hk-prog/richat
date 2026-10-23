@@ -31,8 +31,8 @@ solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
 solana-storage-proto = { workspace = true, features = ["agave-unstable-api"] }
+solana-transaction-status = { workspace = true }
 solana-transaction = { workspace = true, features = ["dev-context-only-utils"] }
-solana-transaction-status = { workspace = true, features = ["agave-unstable-api"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

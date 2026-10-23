@@ -1,5 +1,5 @@
 [toolchain]
-channel = "1.97.1" # agave v4.3.0
+channel = "1.97.1" # agave v4.3 (must match the validator rustc: geyser .so is dlopen-ed, no stable ABI)
 components = ["clippy", "rustfmt"]
 targets = []
 profile = "minimal"

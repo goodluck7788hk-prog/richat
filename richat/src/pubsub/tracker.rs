@@ -316,9 +316,9 @@ pub fn subscriptions_worker(
 
     // Messages head
     let receiver = messages.to_receiver();
-    let mut head_processed = messages.get_current_tail(CommitmentLevel::Processed);
-    let mut head_confirmed = messages.get_current_tail(CommitmentLevel::Processed);
-    let mut head_finalized = messages.get_current_tail(CommitmentLevel::Processed);
+    let mut head_processed = messages.get_next_index(CommitmentLevel::Processed);
+    let mut head_confirmed = messages.get_next_index(CommitmentLevel::Confirmed);
+    let mut head_finalized = messages.get_next_index(CommitmentLevel::Finalized);
 
     // Subscriptions filters pool
     let workers = ThreadPoolBuilder::new()

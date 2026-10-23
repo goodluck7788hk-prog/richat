@@ -71,6 +71,7 @@ pub struct ConfigLimits {
     pub entries: ConfigLimitsEntries,
     pub blocks_meta: ConfigLimitsBlocksMeta,
     pub blocks: ConfigLimitsBlocks,
+    pub block_footer: ConfigLimitsBlockFooter,
 }
 
 impl Default for ConfigLimits {
@@ -84,6 +85,7 @@ impl Default for ConfigLimits {
             entries: Default::default(),
             blocks_meta: Default::default(),
             blocks: Default::default(),
+            block_footer: Default::default(),
         }
     }
 }
@@ -151,10 +153,13 @@ impl ConfigLimits {
         self.transactions_status
             .check_filter(self.name_max, &filter.transactions_status)?;
         self.entries.check_filter(self.name_max, &filter.entries)?;
+        self.entries
+            .check_filter(self.name_max, &filter.entries_update_parent)?;
         self.blocks_meta
             .check_filter(self.name_max, &filter.blocks_meta)?;
         self.blocks.check_filter(self.name_max, &filter.blocks)?;
         Self::check_names_max(filter.block_footer.keys(), self.name_max)?;
+        Self::check_max(filter.block_footer.len(), self.block_footer.max)?;
 
         Ok(())
     }
@@ -165,6 +170,19 @@ impl ConfigLimits {
 pub struct ConfigLimitsSlots {
     #[serde(deserialize_with = "deserialize_num_str")]
     pub max: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigLimitsBlockFooter {
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub max: usize,
+}
+
+impl Default for ConfigLimitsBlockFooter {
+    fn default() -> Self {
+        Self { max: usize::MAX }
+    }
 }
 
 impl Default for ConfigLimitsSlots {
@@ -472,6 +490,8 @@ pub enum ConfigFilterError {
     Signature(String, ParseSignatureError),
     #[error("Unknown commitment level: {0}")]
     UnknownCommitment(i32),
+    #[error("Unsupported filter field: {0}")]
+    UnsupportedFilterField(&'static str),
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -483,7 +503,6 @@ pub struct ConfigFilter {
     pub transactions: HashMap<String, ConfigFilterTransactions>,
     pub transactions_status: HashMap<String, ConfigFilterTransactions>,
     pub entries: HashSet<String>,
-    /// Entry filters (subset of `entries`) that also receive `EntryUpdateParent` updates
     pub entries_update_parent: HashSet<String>,
     pub blocks_meta: HashSet<String>,
     pub blocks: HashMap<String, ConfigFilterBlocks>,
@@ -642,6 +661,11 @@ impl TryFrom<SubscribeRequestFilterAccounts> for ConfigFilterAccounts {
     type Error = ConfigFilterError;
 
     fn try_from(value: SubscribeRequestFilterAccounts) -> Result<Self, Self::Error> {
+        if value.cuckoo_accounts_filter.is_some() {
+            return Err(ConfigFilterError::UnsupportedFilterField(
+                "cuckoo_accounts_filter",
+            ));
+        }
         let account = ConfigFilter::parse_vec_pubkeys(value.account)?;
         let owner = ConfigFilter::parse_vec_pubkeys(value.owner)?;
 
@@ -890,6 +914,9 @@ impl TryFrom<SubscribeRequestFilterTransactions> for ConfigFilterTransactions {
     type Error = ConfigFilterError;
 
     fn try_from(value: SubscribeRequestFilterTransactions) -> Result<Self, Self::Error> {
+        if value.token_accounts.is_some() {
+            return Err(ConfigFilterError::UnsupportedFilterField("token_accounts"));
+        }
         Ok(Self {
             vote: value.vote,
             failed: value.failed,
@@ -915,6 +942,8 @@ impl From<ConfigFilterTransactions> for SubscribeRequestFilterTransactions {
             account_include: ConfigFilter::conv_vec_pubkeys(value.account_include),
             account_exclude: ConfigFilter::conv_vec_pubkeys(value.account_exclude),
             account_required: ConfigFilter::conv_vec_pubkeys(value.account_required),
+            // yellowstone-grpc-proto 12.7.0 新增：可选的 cuckoo filter 形式的 account_include
+            // （用于超大地址集合的紧凑匹配）。我们走普通 account_include，置 None。
             cuckoo_account_include: None,
             token_accounts: None,
         }
@@ -957,6 +986,11 @@ impl TryFrom<SubscribeRequestFilterBlocks> for ConfigFilterBlocks {
     type Error = ConfigFilterError;
 
     fn try_from(value: SubscribeRequestFilterBlocks) -> Result<Self, Self::Error> {
+        if value.cuckoo_account_include.is_some() {
+            return Err(ConfigFilterError::UnsupportedFilterField(
+                "cuckoo_account_include",
+            ));
+        }
         Ok(Self {
             account_include: ConfigFilter::parse_vec_pubkeys(value.account_include)?,
             include_transactions: value.include_transactions,

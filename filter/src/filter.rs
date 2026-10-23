@@ -24,7 +24,7 @@ use {
         SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionStatus,
         subscribe_update::UpdateOneof,
     },
-    smallvec::{SmallVec, smallvec_inline},
+    smallvec::{SmallVec, smallvec},
     solana_account::ReadableAccount,
     solana_commitment_config::CommitmentLevel,
     solana_pubkey::Pubkey,
@@ -209,7 +209,7 @@ impl Filter {
                     .entries_update_parent
                     .filters
                     .iter()
-                    .map(|f| f.as_ref())
+                    .map(|filter| filter.as_ref())
                     .collect::<FilteredUpdateFilters>();
                 if !filters.is_empty() {
                     vec.push(FilteredUpdate {
@@ -650,7 +650,6 @@ impl FilterEntries {
 
 #[derive(Debug, Default, Clone)]
 struct FilterBlockFooter {
-    /// name -> include_certificates
     filters: HashMap<FilterName, bool>,
 }
 
@@ -669,7 +668,6 @@ impl FilterBlockFooter {
         }
     }
 
-    /// Up to two updates: one for filters with certificates and one for filters without.
     fn get_updates<'a>(
         &'a self,
         message: &'a MessageBlockFooter,
@@ -801,7 +799,7 @@ impl FilterBlocks {
             };
 
             FilteredUpdate {
-                filters: smallvec_inline![name.as_ref(); 8],
+                filters: smallvec![name.as_ref()],
                 filtered_update: FilteredUpdateType::Block {
                     message,
                     accounts,

@@ -23,6 +23,30 @@ Please use issues only for reporting bugs or discussing feature-related topics. 
 
 ## Building and running
 
+### Official operator source: Shyft 4.3 baseline
+
+The official maintenance and staged-build source starts at Shyft commit
+`3a14a3d69f3d0b445bbb30c99cd40c001dd2b910`, with reviewed operator reliability
+patches on top. It targets exact Agave 4.3.2, Rust 1.97.1 and Yellowstone proto
+14.0.1. The original operator checkout and production deployment are unchanged.
+
+See [the repair audit](docs/SHYFT-43-REPAIR-AUDIT.md) for upstream overlap,
+deliberate replay/bank policy differences, and performance acceptance limits.
+Shyft already supplies the V1 and 4.3 protocol implementation; duplicate older
+operator converters and the obsolete DeactivatedStake mapping are not retained.
+New footer/parent notifications and source idle timeout remain opt-in.
+
+As of 2026-10-23, the official directory is
+`~/dev/claude-project/richat-shyft-4.3`, an independent ordinary Git checkout with
+self-contained metadata, suitable for the staged builder's source rsync. The
+previous linked worktree and old operator checkout are preserved archives.
+See [source promotion](docs/SHYFT-43-OFFICIAL-SOURCE.md) for the migration checks.
+The maintenance branch is `agave-4.3` in the operator's existing GitHub fork.
+Source publication is not a release or deployment. The dirty-tree build guard
+remains enabled, and release builds and activation require separate approval.
+The sanitized [SLV integration bundle](ops/slv/README.md) versions the staged
+source-selection and preflight changes without production inventory or secrets.
+
 Build Richat by running
 
 ```bash

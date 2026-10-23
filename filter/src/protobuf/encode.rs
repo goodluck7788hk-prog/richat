@@ -144,7 +144,7 @@ impl Message for UpdateOneofLimitedEncodeAccount<'_> {
                 if *slot != 0u64 {
                     encoding::uint64::encode(2u32, slot, buf);
                 }
-                if !is_startup {
+                if *is_startup {
                     encoding::bool::encode(3u32, is_startup, buf);
                 }
                 if let Some(bank_id) = bank_id {
@@ -172,7 +172,7 @@ impl Message for UpdateOneofLimitedEncodeAccount<'_> {
                     } else {
                         0
                     }
-                    + if !is_startup {
+                    + if *is_startup {
                         encoding::bool::encoded_len(3u32, is_startup)
                     } else {
                         0

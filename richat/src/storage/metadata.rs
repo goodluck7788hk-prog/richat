@@ -87,27 +87,48 @@ impl MetadataState {
 ///
 /// This is the minimal metadata needed to answer "where does replay for this
 /// slot begin inside the segment files?"
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotMeta {
     pub slot: Slot,
     pub finalized: bool,
     pub first_index: u64,
     pub segment_id: u64,
+    pub source: Option<Arc<str>>,
 }
 
 impl SlotMeta {
-    fn encode(self, buf: &mut Vec<u8>) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         buf.push(u8::from(self.finalized));
         buf.extend_from_slice(&self.first_index.to_be_bytes());
         buf.extend_from_slice(&self.segment_id.to_be_bytes());
+        if let Some(source) = &self.source {
+            let length = u32::try_from(source.len()).expect("source name exceeds u32 length");
+            buf.extend_from_slice(&length.to_be_bytes());
+            buf.extend_from_slice(source.as_bytes());
+        }
     }
 
     fn decode(slot: Slot, mut value: &[u8]) -> anyhow::Result<Self> {
+        let finalized = take_bool(&mut value)?;
+        let first_index = take_u64(&mut value)?;
+        let segment_id = take_u64(&mut value)?;
+        let source = if value.is_empty() {
+            None
+        } else {
+            let length = take_u32(&mut value)? as usize;
+            let bytes = value
+                .get(..length)
+                .context("unexpected eof while decoding slot source")?;
+            Some(Arc::from(
+                std::str::from_utf8(bytes).context("invalid slot source utf-8")?,
+            ))
+        };
         Ok(Self {
             slot,
-            finalized: take_bool(&mut value)?,
-            first_index: take_u64(&mut value)?,
-            segment_id: take_u64(&mut value)?,
+            finalized,
+            first_index,
+            segment_id,
+            source,
         })
     }
 }
@@ -224,10 +245,10 @@ pub struct MetadataMirror {
 impl MetadataMirror {
     fn apply_chunk_commit(&mut self, commit: &MetadataChunkCommit) {
         for meta in &commit.new_slots {
-            self.slots.insert(meta.slot, *meta);
+            self.slots.insert(meta.slot, meta.clone());
         }
         for meta in &commit.updated_slots {
-            self.slots.insert(meta.slot, *meta);
+            self.slots.insert(meta.slot, meta.clone());
         }
         self.segments
             .insert(commit.segment.segment_id, commit.segment);
@@ -578,5 +599,78 @@ fn take_bool(slice: &mut &[u8]) -> anyhow::Result<bool> {
         0 => Ok(false),
         1 => Ok(true),
         value => anyhow::bail!("invalid bool value: {value}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEGACY_SLOT_VALUE: [u8; 17] = [1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 9];
+
+    #[test]
+    fn legacy_slot_metadata_without_source_keeps_its_original_encoding() {
+        let metadata = SlotMeta::decode(100, &LEGACY_SLOT_VALUE).unwrap();
+        assert_eq!(
+            (
+                metadata.finalized,
+                metadata.first_index,
+                metadata.segment_id
+            ),
+            (true, 5, 9)
+        );
+        assert!(metadata.source.is_none());
+        let mut encoded = Vec::new();
+        metadata.encode(&mut encoded);
+        assert_eq!(encoded, LEGACY_SLOT_VALUE);
+    }
+
+    #[test]
+    fn optional_source_suffix_survives_metadata_roundtrip() {
+        for suffix in [
+            &[0, 0, 0, 3, b'o', b'n', b'e'][..],
+            &[0, 0, 0, 0][..],
+            &[
+                0, 0, 0, 11, b'n', b'o', b'd', b'e', b'-', 0xe6, 0x9d, 0xb1, 0xe4, 0xba, 0xac,
+            ][..],
+        ] {
+            let mut original = LEGACY_SLOT_VALUE.to_vec();
+            original.extend_from_slice(suffix);
+            let metadata = SlotMeta::decode(100, &original).unwrap();
+            let mut encoded = Vec::new();
+            metadata.encode(&mut encoded);
+            assert_eq!(encoded, original);
+        }
+    }
+
+    #[test]
+    fn source_metadata_keeps_legacy_reader_fields_unchanged() {
+        let mut encoded = Vec::new();
+        SlotMeta {
+            slot: 100,
+            finalized: true,
+            first_index: 5,
+            segment_id: 9,
+            source: Some(Arc::from("one")),
+        }
+        .encode(&mut encoded);
+        let mut legacy_reader = encoded.as_slice();
+        assert!(take_bool(&mut legacy_reader).unwrap());
+        assert_eq!(take_u64(&mut legacy_reader).unwrap(), 5);
+        assert_eq!(take_u64(&mut legacy_reader).unwrap(), 9);
+        assert_eq!(legacy_reader, &[0, 0, 0, 3, b'o', b'n', b'e']);
+    }
+
+    #[test]
+    fn malformed_source_suffix_is_rejected() {
+        for suffix in [
+            &[0, 0][..],
+            &[0, 0, 0, 4, b'o'][..],
+            &[0, 0, 0, 1, 0xff][..],
+        ] {
+            let mut encoded = LEGACY_SLOT_VALUE.to_vec();
+            encoded.extend_from_slice(suffix);
+            assert!(SlotMeta::decode(100, &encoded).is_err());
+        }
     }
 }

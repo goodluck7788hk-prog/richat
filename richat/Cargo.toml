@@ -12,7 +12,7 @@ publish = { workspace = true }
 
 [dependencies]
 affinity-linux = { workspace = true }
-agave-reserved-account-keys = { workspace = true, features = ["agave-unstable-api"] }
+agave-reserved-account-keys = { workspace = true }
 anyhow = { workspace = true }
 arrayvec = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -45,7 +45,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 signal-hook = { workspace = true }
 smallvec = { workspace = true }
 solana-account = { workspace = true }
-solana-account-decoder = { workspace = true, features = ["agave-unstable-api"] }
+solana-account-decoder = { workspace = true }
 solana-clock = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-message = { workspace = true }
@@ -55,8 +55,8 @@ solana-rpc-client-api = { workspace = true }
 solana-signature = { workspace = true }
 solana-transaction = { workspace = true }
 solana-transaction-error = { workspace = true }
-solana-transaction-status = { workspace = true, features = ["agave-unstable-api"] }
-solana-version = { workspace = true, features = ["agave-unstable-api"] }
+solana-transaction-status = { workspace = true }
+solana-version = { workspace = true }
 spl-token-2022-interface = { workspace = true }
 thiserror = { workspace = true }
 tikv-jemallocator = { workspace = true }
@@ -75,9 +75,8 @@ git-version = { workspace = true }
 tonic-build = { workspace = true }
 vergen = { workspace = true, features = ["build", "rustc"] }
 
-[package.metadata.cargo-machete]
-# used via `#[serde(with = "humantime_serde")]` and build.rs `codec_path`
-ignored = ["humantime-serde", "tonic-prost"]
-
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

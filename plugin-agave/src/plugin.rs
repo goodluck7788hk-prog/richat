@@ -363,10 +363,12 @@ impl GeyserPlugin for Plugin {
         let ReplicaBlockFooterInfoVersions::V0_0_1(footer) = block_footer;
 
         let inner = self.inner.as_ref().expect("initialized");
-        inner.messages.push(
-            ProtobufMessage::BlockFooter { footer, bank_id },
-            inner.encoder,
-        );
+        if inner.block_footer {
+            inner.messages.push(
+                ProtobufMessage::BlockFooter { footer, bank_id },
+                inner.encoder,
+            );
+        }
 
         Ok(())
     }
@@ -424,3 +426,6 @@ pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
     let plugin: Box<dyn GeyserPlugin> = Box::new(plugin);
     Box::into_raw(plugin)
 }
+
+#[cfg(test)]
+mod tests;

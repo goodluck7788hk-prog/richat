@@ -1,0 +1,451 @@
+---
+# Stage-only build of richat: BOTH the geyser plugin .so AND the fanout daemon
+# binary, from the LOCALLY MAINTAINED source tree (rsync, not git clone —
+# richat is our fork, maintained in ~/dev/claude-project/richat-shyft-4.3).
+# Produces one versioned release:
+#   /home/solv/richat-geyser/releases/<version>/librichat_plugin_agave.so
+#   /home/solv/richat-geyser/releases/<version>/richat          (daemon)
+#   /home/solv/richat-geyser/releases/<version>/BUILD_INFO
+# but does NOT touch anything live. Activation = switch_richat_staged.yml.
+#
+# Production state UNTOUCHED by this playbook:
+#   - /home/solv/librichat_plugin_agave.so      (the path geyser.json points at)
+#   - /home/solv/richat-geyser/current           (the "active release" link)
+#   - /home/solv/richat                          (richat.service ExecStart)
+#   - /home/solv/geyser.json, richat-config.yml, both services
+#
+# Why plugin + daemon together: they share richat-proto / yellowstone-grpc-proto;
+# a wire-format change (e.g. V1 tx 2026-09-17, proto 13 for agave 4.3) must land
+# in both. Why native codegen: we build ON the host that runs the artifact.
+# Why the rustc must match agave's: the .so is dlopen-ed into agave-validator and
+# the GeyserPlugin trait object crosses that boundary with no stable Rust ABI —
+# rust-toolchain.toml in the richat tree pins it (1.97.1 for agave 4.3).
+#
+# Usage:
+#   ansible-playbook -i <inv> mainnet-rpc/build_richat_staged.yml \
+#     --limit <host> -e richat_version=richat-v11.0.0-agave4.3.2
+#   optional: -e richat_local_src=/path/to/richat   -e allow_dirty=yes
+#             -e richat_rustflags="-C target-cpu=native"
+#
+# If -e richat_version= is omitted, mainnet_rpcs.richat_version from
+# ~/.slv/versions.yml is used (it is only a LABEL for the release dir — the
+# code built is whatever is checked out in richat_local_src).
+- name: Build richat plugin + daemon into a staged release (no live changes)
+  hosts: all
+  become: true
+  vars_files:
+    - ~/.slv/versions.yml
+    - '{{ playbook_dir }}/staged_compatibility.yml'
+  vars:
+    richat_local_src: "{{ lookup('env', 'HOME') }}/dev/claude-project/richat-shyft-4.3"
+    richat_install_root: "/home/solv/richat-geyser"
+    richat_lib_name: "librichat_plugin_agave.so"
+    richat_daemon_name: "richat"
+    richat_rustflags: "-C target-cpu=native"
+    allow_dirty: "no"
+    # Per-version src checkout under richat-staging/ so concurrent versions
+    # don't trample each other.
+    staging_root: "/home/solv/richat-staging"
+
+  tasks:
+    - name: Resolve richat release label (overridable via -e richat_version=)
+      set_fact:
+        richat_version_resolved: "{{ richat_version | default(mainnet_rpcs.richat_version | default('', true), true) }}"
+
+    - name: Ensure richat_version is provided
+      assert:
+        that:
+          - richat_version_resolved is match('^[A-Za-z0-9][A-Za-z0-9._+-]*$')
+        fail_msg: "richat_version must be provided (via -e richat_version= or mainnet_rpcs.richat_version in ~/.slv/versions.yml)"
+
+    - name: Compute staging paths
+      set_fact:
+        richat_src_dir: "{{ staging_root }}/{{ richat_version_resolved }}/src"
+        richat_release_dir: "{{ richat_install_root }}/releases/{{ richat_version_resolved }}"
+        live_so_link: "/home/solv/{{ richat_lib_name }}"
+        live_current_link: "{{ richat_install_root }}/current"
+
+    # ── Local source provenance (controller side) ───────────────────────────
+    - name: Inspect local richat source tree
+      delegate_to: localhost
+      become: false
+      run_once: true
+      shell: |
+        set -e
+        cd "{{ richat_local_src }}"
+        if [ ! -d .git ] || [ -L .git ] || [ -f .git/commondir ] || [ -s .git/objects/info/alternates ]; then
+          echo "richat_local_src must have a self-contained .git directory; linked worktrees, symlinks and external object alternates cannot be rsynced for builds" >&2
+          exit 1
+        fi
+        for git_override in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE; do
+          if [ -n "${!git_override:-}" ]; then
+            echo "Unset $git_override before inspecting the build source" >&2
+            exit 1
+          fi
+        done
+        metadata_symlink=$(find .git -type l -print -quit)
+        if [ -n "$metadata_symlink" ]; then
+          echo "Git metadata must not contain symlinks: $metadata_symlink" >&2
+          exit 1
+        fi
+        source_commit=$(git rev-parse --verify 'HEAD^{commit}')
+        source_describe=$(git describe --tags --always --dirty)
+        source_branch=$(git rev-parse --abbrev-ref HEAD)
+        source_status=$(git status --porcelain)
+        source_dirty=no
+        if [ -n "$source_status" ]; then source_dirty=yes; fi
+        printf 'commit=%s\ndescribe=%s\nbranch=%s\ndirty=%s\n' "$source_commit" "$source_describe" "$source_branch" "$source_dirty"
+        # (no quoted sed regex here: ansible splits free-form shell args and chokes on it)
+        echo "toolchain=$(grep -m1 '^channel' rust-toolchain.toml | cut -d= -f2 | cut -d'#' -f1 | tr -d ' \"')"
+        echo "lock_sha256=$(shasum -a 256 Cargo.lock | cut -d' ' -f1)"
+        echo "geyser_interface=$(awk '/^name = "agave-geyser-plugin-interface"$/{getline; print $3; exit}' Cargo.lock | tr -d '\"')"
+        echo "quinn_versions=$(awk '/^name = "quinn"$/{getline; print $3}' Cargo.lock | tr -d '\"' | paste -sd, -)"
+        echo "quinn_proto_versions=$(awk '/^name = "quinn-proto"$/{getline; print $3}' Cargo.lock | tr -d '\"' | paste -sd, -)"
+      args:
+        executable: /bin/bash
+      register: local_src
+      changed_when: false
+
+    - name: Parse local source facts
+      set_fact:
+        src_facts: "{{ dict(local_src.stdout_lines | map('split', '=', 1) | list) }}"
+
+    - name: Refuse to build an uncommitted tree (reproducibility)
+      assert:
+        that:
+          - src_facts.dirty == 'no' or allow_dirty == 'yes'
+        fail_msg: |
+          {{ richat_local_src }} has uncommitted changes ({{ src_facts.describe }}).
+          Commit first so the artifact maps to a commit, or pass -e allow_dirty=yes.
+
+    - name: Validate source toolchain and v4.3 dependency pairing
+      assert:
+        that:
+          - src_facts.toolchain is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+          - src_facts.geyser_interface is match('^[0-9]+[.][0-9]+[.][0-9]+$')
+          - "'agave' not in richat_version_resolved or staged_richat_expected_agave | length > 0"
+          - staged_richat_expected_agave | length == 0 or staged_richat_expected_agave == src_facts.geyser_interface
+          - not src_facts.geyser_interface.startswith('4.3.') or src_facts.geyser_interface in staged_agave_toolchains
+          - not src_facts.geyser_interface.startswith('4.3.') or src_facts.toolchain == staged_agave_toolchains.get(src_facts.geyser_interface, '')
+        fail_msg: "Release label, Geyser dependency and pinned Rust toolchain do not match."
+
+    - name: Validate QUIC dependency safety
+      assert:
+        that:
+          - item is match('^[0-9]+[.][0-9]+[.][0-9]+$')
+          - item is version(staged_quinn_proto_min_version, '>=')
+        fail_msg: 'Every quinn-proto dependency must be a stable version >= {{ staged_quinn_proto_min_version }} (RUSTSEC-2026-0338/0339/0340/0343).'
+      loop: "{{ src_facts.quinn_proto_versions.split(',') }}"
+
+    - name: Audit local richat dependency locks
+      delegate_to: localhost
+      become: false
+      run_once: true
+      command:
+        argv:
+          - cargo
+          - +stable
+          - audit
+          - --file
+          - "{{ item }}"
+          - --json
+        chdir: "{{ richat_local_src }}"
+      loop:
+        - Cargo.lock
+        - plugin-agave/fuzz/Cargo.lock
+      changed_when: false
+
+    - name: Refuse to overwrite the release that is live right now
+      shell: "readlink -f {{ live_current_link }} 2>/dev/null || true"
+      register: live_release_dir
+      changed_when: false
+
+    - name: Assert target release dir is not the live one
+      assert:
+        that:
+          - live_release_dir.stdout != richat_release_dir
+        fail_msg: |
+          {{ richat_release_dir }} is the LIVE release. Build under a new label
+          (e.g. {{ richat_version_resolved }}-2) instead of overwriting it.
+
+    - name: Refuse to overwrite active or running Richat release paths
+      shell: |
+        set -euo pipefail
+        target=$(readlink -m {{ richat_release_dir | quote }})
+        daemon_id=$(systemctl show -p MainPID --value richat.service)
+        for candidate in {{ live_so_link | quote }} /home/solv/richat "/proc/${daemon_id:-0}/exe"; do
+          resolved=$(readlink -f "$candidate" 2>/dev/null || true)
+          case "$resolved" in
+            "$target"|"$target"/*) echo "Refusing to rebuild active or running release: $resolved" >&2; exit 1 ;;
+          esac
+        done
+        validator_id=$(systemctl show -p MainPID --value solv.service)
+        if [ "${validator_id:-0}" != 0 ]; then
+          test -r "/proc/$validator_id/maps"
+          if grep -Fq -- "$target/" "/proc/$validator_id/maps"; then
+            echo "Refusing to rebuild a release still loaded by solv.service" >&2
+            exit 1
+          fi
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Show build plan
+      debug:
+        msg: |
+          Will build richat {{ richat_version_resolved }} (plugin + daemon)
+            from:      {{ richat_local_src }} @ {{ src_facts.describe }} ({{ src_facts.branch }})
+            toolchain: {{ src_facts.toolchain }}   RUSTFLAGS: {{ richat_rustflags }}
+            src:       {{ richat_src_dir }}
+            release:   {{ richat_release_dir }}/{ {{ richat_lib_name }}, {{ richat_daemon_name }}, BUILD_INFO }
+          NOT touched (live state):
+            - {{ live_so_link }}
+            - {{ live_current_link }}
+            - /home/solv/{{ richat_daemon_name }}  (richat.service)
+            - geyser.json / richat-config.yml / both services
+
+    - name: Check Rust toolchain is present
+      become: no
+      shell: |
+        set -e
+        if [ -f "$HOME/.cargo/env" ]; then
+          # shellcheck disable=SC1091
+          source "$HOME/.cargo/env"
+        fi
+        command -v rustc
+        rustc --version
+      args:
+        executable: /bin/bash
+      environment:
+        PATH: "/home/solv/.cargo/bin:{{ ansible_env.PATH }}"
+      register: rust_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if Rust toolchain is missing
+      assert:
+        that:
+          - rust_check.rc == 0
+        fail_msg: |
+          Rust toolchain not found on remote (rc={{ rust_check.rc }}).
+          Run: ansible-playbook -i <inv> mainnet-validator/install_rust.yml --limit <host>
+
+    - name: Ensure build dependencies are installed
+      apt:
+        name:
+          - build-essential
+          - pkg-config
+          - libssl-dev
+          - libudev-dev
+          - libclang-dev
+          - cmake
+          - protobuf-compiler
+          - git
+          - curl
+          - rsync
+        state: present
+        update_cache: yes
+
+    - name: Ensure staging + release directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: solv
+        group: solv
+        mode: "0755"
+      loop:
+        - "{{ staging_root }}"
+        - "{{ staging_root }}/{{ richat_version_resolved }}"
+        - "{{ richat_src_dir }}"
+        - "{{ richat_install_root }}"
+        - "{{ richat_install_root }}/releases"
+        - "{{ richat_release_dir }}"
+
+    # rsync from the controller (ssh alias = inventory_hostname). .git is kept
+    # because plugin-agave/build.rs calls git_version!() (fails without it).
+    # target/ is excluded both ways so incremental rebuilds keep their cache.
+    - name: Sync local richat source to the host (rsync, incl. .git)
+      delegate_to: localhost
+      become: false
+      shell: >-
+        rsync -az --delete --exclude target/
+        -e 'ssh -o ConnectTimeout=15'
+        "{{ richat_local_src }}/" "{{ inventory_hostname }}:{{ richat_src_dir }}/"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Hand the synced tree to solv
+      file:
+        path: "{{ richat_src_dir }}"
+        owner: solv
+        group: solv
+        recurse: yes
+
+    - name: Verify synced source matches the inspected local source
+      become_user: solv
+      shell: |
+        set -euo pipefail
+        cd {{ richat_src_dir | quote }}
+        test "$(git rev-parse HEAD)" = {{ src_facts.commit | quote }}
+        test "$(sha256sum Cargo.lock | cut -d' ' -f1)" = {{ src_facts.lock_sha256 | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Mark release build incomplete
+      copy:
+        content: "Build incomplete; do not switch to this release.\n"
+        dest: "{{ richat_release_dir }}/.build-incomplete"
+        owner: solv
+        group: solv
+        mode: "0644"
+
+    # Pre-install the toolchain pinned by rust-toolchain.toml in a single
+    # rustup call. This avoids races with other concurrent builds (e.g.
+    # agave-staged) that may also be touching ~/.rustup/downloads/ — when
+    # two rustup downloads collide on the same .partial file, one of them
+    # crashes with "could not rename 'downloaded' file".
+    - name: Pre-install pinned rust toolchain (avoid concurrent rustup races)
+      become_user: solv
+      shell: |
+        set -e
+        if [ -f "$HOME/.cargo/env" ]; then
+          source "$HOME/.cargo/env"
+        fi
+        cd {{ richat_src_dir | quote }}
+        rustup toolchain install {{ src_facts.toolchain | quote }} --profile minimal
+        rustc --version
+        test "$(rustc --version | cut -d' ' -f2)" = {{ src_facts.toolchain | quote }}
+      args:
+        executable: /bin/bash
+      environment:
+        PATH: "/home/solv/.cargo/bin:{{ ansible_env.PATH }}"
+      register: toolchain_warmup
+      retries: 3
+      delay: 15
+      until: toolchain_warmup.rc == 0
+      changed_when: false
+
+    - name: Build richat-plugin-agave + richat daemon (cargo build --release, native)
+      become_user: solv
+      shell: |
+        set -e
+        if [ -f "$HOME/.cargo/env" ]; then
+          source "$HOME/.cargo/env"
+        fi
+        cd {{ richat_src_dir | quote }}
+        cargo build --locked --release -p richat-plugin-agave --features rustls-install-default-provider
+        cargo build --locked --release -p richat
+      args:
+        executable: /bin/bash
+      environment:
+        PATH: "/home/solv/.cargo/bin:{{ ansible_env.PATH }}"
+        RUSTFLAGS: "{{ richat_rustflags }}"
+      register: build_result
+
+    - name: Verify built artifacts exist
+      stat:
+        path: "{{ richat_src_dir }}/target/release/{{ item }}"
+      loop:
+        - "{{ richat_lib_name }}"
+        - "{{ richat_daemon_name }}"
+      register: artifact_stat
+
+    - name: Fail if an artifact was not built
+      assert:
+        that:
+          - artifact_stat.results | map(attribute='stat.exists') | min
+        fail_msg: "Build failed: plugin or daemon missing under {{ richat_src_dir }}/target/release/"
+
+    - name: Copy built plugin to versioned release directory
+      copy:
+        src: "{{ richat_src_dir }}/target/release/{{ richat_lib_name }}"
+        dest: "{{ richat_release_dir }}/{{ richat_lib_name }}"
+        remote_src: yes
+        owner: solv
+        group: solv
+        mode: "0644"
+
+    - name: Copy built daemon to versioned release directory
+      copy:
+        src: "{{ richat_src_dir }}/target/release/{{ richat_daemon_name }}"
+        dest: "{{ richat_release_dir }}/{{ richat_daemon_name }}"
+        remote_src: yes
+        owner: solv
+        group: solv
+        mode: "0755"
+
+    - name: Write BUILD_INFO into the release dir
+      become_user: solv
+      shell: |
+        set -euo pipefail
+        source "$HOME/.cargo/env"
+        cd {{ richat_src_dir | quote }}
+        test "$(sha256sum Cargo.lock | cut -d' ' -f1)" = {{ src_facts.lock_sha256 | quote }}
+        lock() { awk -v n="$1" '$0=="name = \""n"\""{getline; gsub(/version = |"/,""); print; exit}' Cargo.lock; }
+        {
+          echo "built_at:                 $(date -Iseconds)"
+          echo "label:                    {{ richat_version_resolved }}"
+          echo "source:                   {{ richat_local_src }} ({{ src_facts.branch }})"
+          echo "git_commit:               {{ src_facts.commit }}"
+          echo "git_describe:             {{ src_facts.describe }}"
+          echo "dirty:                    {{ src_facts.dirty }}"
+          echo "lock_sha256:              {{ src_facts.lock_sha256 }}"
+          echo "rustc:                    $(rustc --version)"
+          echo "RUSTFLAGS:                {{ richat_rustflags }}"
+          echo "native_cpu:               $(rustc --print target-cpus | sed -n 's/.*(currently \(.*\))\./\1/p')"
+          echo "agave-geyser-plugin-intf: $(lock agave-geyser-plugin-interface)"
+          echo "yellowstone-grpc-proto:   $(lock yellowstone-grpc-proto)"
+          echo "quinn:                    {{ src_facts.quinn_versions }}"
+          echo "quinn-proto:              {{ src_facts.quinn_proto_versions }}"
+          echo "audit-vulnerabilities:    0"
+          echo "plugin_sha256:            $(sha256sum {{ richat_release_dir | quote }}/{{ richat_lib_name }} | cut -d' ' -f1)"
+          echo "daemon_sha256:            $(sha256sum {{ richat_release_dir | quote }}/{{ richat_daemon_name }} | cut -d' ' -f1)"
+        } > {{ richat_release_dir | quote }}/BUILD_INFO.tmp
+        mv {{ richat_release_dir | quote }}/BUILD_INFO.tmp {{ richat_release_dir | quote }}/BUILD_INFO
+        cd {{ richat_release_dir | quote }}
+        sha256sum {{ richat_lib_name }} {{ richat_daemon_name }} BUILD_INFO > SHA256SUMS.tmp
+        mv SHA256SUMS.tmp SHA256SUMS
+        sha256sum --check SHA256SUMS
+        rm .build-incomplete
+        cat BUILD_INFO
+      args:
+        executable: /bin/bash
+      environment:
+        PATH: "/home/solv/.cargo/bin:{{ ansible_env.PATH }}"
+      register: build_info
+      changed_when: true
+
+    - name: Read current live plugin target (if any)
+      become: no
+      shell: "readlink -f {{ live_so_link }} 2>/dev/null || echo '(no live link)'"
+      register: live_target
+      changed_when: false
+      failed_when: false
+
+    - name: Print build summary and manual switch instructions
+      debug:
+        msg: |
+          ──────────────────────────────────────────────────────────────
+          RICHAT BUILD COMPLETE (plugin + daemon) — production state UNCHANGED
+          ──────────────────────────────────────────────────────────────
+          Host:               {{ inventory_hostname }}
+          Release:            {{ richat_release_dir }}
+          Currently active:   {{ live_target.stdout }}
+
+          BUILD_INFO:
+          {{ build_info.stdout | indent(2) }}
+
+          ⚠️ The plugin's rustc MUST equal the rustc of the agave-validator that
+            will load it (compare with that agave's BUILD_INFO / rust-toolchain).
+
+          To activate (dry-run first, then --apply; neither restarts anything):
+            ~/.slv/scripts/switch-richat.sh {{ inventory_hostname }} {{ richat_version_resolved }}
+            ~/.slv/scripts/switch-richat.sh {{ inventory_hostname }} {{ richat_version_resolved }} --apply
+            ssh {{ inventory_hostname }} 'sudo systemctl restart richat.service'   # daemon FIRST
+            ssh {{ inventory_hostname }} 'sudo systemctl restart solv.service'     # then plugin (dlopen at start)
+          (daemon first: a new daemon parses old-plugin data; an old daemon can
+           choke on new enum values the new plugin emits, e.g. RewardType 6)
+          ──────────────────────────────────────────────────────────────

@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
         config.channel.ensure_sources_have_reconnect()?;
     }
     let streams_total = config.channel.sources.len();
-    let dedup_required = sources_sighup_reload || streams_total > 1;
+    let dedup_mode = config.channel.dedup_mode();
     let reload_notify = Arc::new(Notify::new());
 
     let (mut messages, mut threads) = Messages::new(
@@ -137,7 +137,7 @@ fn main() -> anyhow::Result<()> {
                         tokio::select! {
                             biased;
                             message = stream.next() => match message {
-                                Some(Ok((source_name, message))) => sender.push(dedup_required, source_name, message),
+                                Some(Ok((source_name, message))) => sender.push(dedup_mode, source_name, message)?,
                                 Some(Err(error @ ReceiveError::ReplayFailed)) => {
                                     eprintln!("Error: {error:?}");
                                     std::process::exit(2);

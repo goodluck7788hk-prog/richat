@@ -33,6 +33,7 @@ use {
         fs::{File, OpenOptions},
         io::{Read, Seek, SeekFrom, Write},
         path::PathBuf,
+        sync::Arc,
         thread,
         time::Instant,
     },
@@ -243,6 +244,7 @@ pub enum WriterCommand {
         head: u64,
         index: u64,
         message: ParsedMessage,
+        source: Option<Arc<str>>,
     },
     RemoveReplay {
         slot: Slot,
@@ -273,8 +275,10 @@ struct RawRecord {
 
 #[derive(Debug)]
 struct PendingSlot {
+    init: bool,
     slot: Slot,
     first_index: u64,
+    source: Option<Arc<str>>,
 }
 
 #[derive(Debug, Default)]
@@ -288,7 +292,15 @@ struct PendingChunkMeta {
 }
 
 impl PendingChunkMeta {
-    fn push(&mut self, init: bool, slot: Slot, head: u64, index: u64, message: &ParsedMessage) {
+    fn push(
+        &mut self,
+        init: bool,
+        slot: Slot,
+        head: u64,
+        index: u64,
+        message: &ParsedMessage,
+        source: Option<Arc<str>>,
+    ) {
         if self.record_count == 0 {
             self.first_index = index;
         }
@@ -297,11 +309,30 @@ impl PendingChunkMeta {
             .estimated_uncompressed_size
             .saturating_add(message.size().saturating_add(16));
 
-        if init {
-            self.pending_slots.push(PendingSlot {
-                slot,
-                first_index: head,
-            });
+        if init || source.is_some() {
+            match self
+                .pending_slots
+                .iter_mut()
+                .rev()
+                .find(|pending| pending.slot == slot)
+            {
+                Some(pending)
+                    if (!init || pending.init)
+                        && (pending.source.is_none()
+                            || source.is_none()
+                            || pending.source == source) =>
+                {
+                    if pending.source.is_none() {
+                        pending.source = source;
+                    }
+                }
+                _ => self.pending_slots.push(PendingSlot {
+                    init,
+                    slot,
+                    first_index: head,
+                    source,
+                }),
+            }
         }
         if let ParsedMessage::Slot(message) = message
             && message.status() == SlotStatus::SlotFinalized
@@ -363,8 +394,9 @@ fn run_collector(
                         head,
                         index,
                         message,
+                        source,
                     } => {
-                        pending.push(init, slot, head, index, &message);
+                        pending.push(init, slot, head, index, &message, source);
                         records.push(RawRecord { slot, message });
                         counter!(CHANNEL_STORAGE_WRITE_COLLECTOR_INDEX).absolute(index);
 
@@ -773,26 +805,52 @@ impl SegmentWriter {
         segment.file_len += chunk.size;
         segment.chunk_count += 1;
 
-        let mut new_slots = Vec::with_capacity(pending_slots.len());
+        let mut slot_updates = BTreeMap::<Slot, SlotMeta>::new();
         for pending in pending_slots {
-            new_slots.push(SlotMeta {
-                slot: pending.slot,
-                finalized: pending_finalized.contains(&pending.slot),
-                first_index: pending.first_index,
-                segment_id: chunk.segment_id,
-            });
-        }
-
-        let mut updated_slots = Vec::with_capacity(pending_finalized.len());
-        for slot in pending_finalized {
-            if let Some(meta) = catalog.slots.get(slot)
-                && !new_slots.iter().any(|new_meta| new_meta.slot == *slot)
+            if !pending.init
+                && !catalog.slots.contains_key(&pending.slot)
+                && !slot_updates.contains_key(&pending.slot)
             {
-                let mut meta = *meta;
-                meta.finalized = true;
-                updated_slots.push(meta);
+                continue;
+            }
+            let metadata = slot_updates.entry(pending.slot).or_insert_with(|| {
+                catalog
+                    .slots
+                    .get(&pending.slot)
+                    .cloned()
+                    .unwrap_or_else(|| SlotMeta {
+                        slot: pending.slot,
+                        finalized: false,
+                        first_index: pending.first_index,
+                        segment_id: chunk.segment_id,
+                        source: None,
+                    })
+            });
+            if let Some(source) = &pending.source {
+                anyhow::ensure!(
+                    metadata.source.as_ref().is_none_or(|owner| owner == source),
+                    "slot {} source ownership changed from {:?} to {source}",
+                    pending.slot,
+                    metadata.source,
+                );
+                if metadata.source.is_none() {
+                    metadata.source = Some(Arc::clone(source));
+                }
             }
         }
+
+        for slot in pending_finalized {
+            if let Some(metadata) = slot_updates.get_mut(slot) {
+                metadata.finalized = true;
+            } else if let Some(metadata) = catalog.slots.get(slot) {
+                let mut metadata = metadata.clone();
+                metadata.finalized = true;
+                slot_updates.insert(*slot, metadata);
+            }
+        }
+        let (new_slots, updated_slots) = slot_updates
+            .into_values()
+            .partition(|metadata| !catalog.slots.contains_key(&metadata.slot));
 
         Ok(MetadataChunkCommit {
             new_slots,
@@ -899,4 +957,278 @@ pub fn spawn_write_pipeline(
 
 fn segment_file_name(segment_id: u64) -> String {
     format!("{segment_id:012}.seg")
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        prost::Message as _,
+        richat_proto::geyser::{
+            SubscribeUpdate, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        },
+    };
+
+    fn message(slot: Slot) -> ParsedMessage {
+        let update = SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                status: SlotStatus::SlotCreatedBank as i32,
+                ..Default::default()
+            })),
+            created_at: Some(Default::default()),
+            ..Default::default()
+        };
+        Message::parse(update.encode_to_vec().into(), MessageParserEncoding::Prost)
+            .unwrap()
+            .into()
+    }
+
+    fn commit(
+        catalog: &MetadataMirror,
+        pending: &[PendingSlot],
+    ) -> anyhow::Result<MetadataChunkCommit> {
+        SegmentWriter::build_chunk_commit(
+            catalog,
+            SegmentMeta::empty(9, 0),
+            ChunkMeta {
+                segment_id: 9,
+                offset: 0,
+                size: 100,
+                compression: 0,
+                first_index: 3,
+                last_index: 4,
+            },
+            pending,
+            &HashSet::from([100]),
+        )
+    }
+
+    fn catalog(source: Option<&str>) -> MetadataMirror {
+        let mut catalog = MetadataMirror::default();
+        catalog.slots.insert(
+            100,
+            SlotMeta {
+                slot: 100,
+                finalized: false,
+                first_index: 1,
+                segment_id: 2,
+                source: source.map(Arc::from),
+            },
+        );
+        catalog
+    }
+
+    #[test]
+    fn pending_chunk_coalesces_repeated_identical_owner_metadata() {
+        let mut pending = PendingChunkMeta::default();
+        let message = message(100);
+        for index in 1..=1_024 {
+            pending.push(
+                index == 1,
+                100,
+                index,
+                index,
+                &message,
+                Some(Arc::from("one")),
+            );
+        }
+        assert_eq!(pending.record_count, 1_024);
+        assert_eq!((pending.first_index, pending.last_index), (1, 1_024));
+        assert_eq!(pending.pending_slots.len(), 1);
+        assert!(pending.pending_slots[0].init);
+        assert_eq!(pending.pending_slots[0].first_index, 1);
+        let result = commit(&MetadataMirror::default(), &pending.pending_slots).unwrap();
+        assert_eq!(result.new_slots.len(), 1);
+        assert_eq!(result.new_slots[0].source.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn pending_chunk_merges_late_owner_without_resetting_initial_head() {
+        let mut pending = PendingChunkMeta::default();
+        let message = message(100);
+        pending.push(true, 100, 1, 1, &message, None);
+        pending.push(false, 100, 999, 2, &message, Some(Arc::from("one")));
+        pending.push(true, 100, 999, 3, &message, None);
+        assert_eq!(pending.pending_slots.len(), 1);
+        assert!(pending.pending_slots[0].init);
+        assert_eq!(pending.pending_slots[0].first_index, 1);
+        let result = commit(&MetadataMirror::default(), &pending.pending_slots).unwrap();
+        assert_eq!(result.new_slots.len(), 1);
+        assert_eq!(result.new_slots[0].first_index, 1);
+        assert_eq!(result.new_slots[0].source.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn pending_chunk_late_owner_across_chunks_preserves_original_start() {
+        let mut pending = PendingChunkMeta::default();
+        let message = message(100);
+        pending.push(true, 100, 1, 1, &message, None);
+        let initial = std::mem::take(&mut pending);
+        let initial = commit(&MetadataMirror::default(), &initial.pending_slots).unwrap();
+        assert_eq!(initial.new_slots.len(), 1);
+        assert!(initial.new_slots[0].source.is_none());
+        let mut catalog = MetadataMirror::default();
+        catalog.slots.insert(100, initial.new_slots[0].clone());
+
+        for index in 2..=16 {
+            pending.push(false, 100, 999, index, &message, Some(Arc::from("one")));
+        }
+        assert_eq!(pending.pending_slots.len(), 1);
+        assert!(!pending.pending_slots[0].init);
+        let result = commit(&catalog, &pending.pending_slots).unwrap();
+        assert!(result.new_slots.is_empty());
+        assert_eq!(result.updated_slots.len(), 1);
+        assert_eq!(result.updated_slots[0].first_index, 1);
+        assert_eq!(result.updated_slots[0].segment_id, 9);
+        assert_eq!(result.updated_slots[0].source.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn pending_chunk_cannot_coalesce_away_conflicting_owners() {
+        let mut pending = PendingChunkMeta::default();
+        let message = message(100);
+        for (index, owner) in [(1, "one"), (2, "two"), (3, "one"), (4, "one")] {
+            pending.push(index == 1, 100, 1, index, &message, Some(Arc::from(owner)));
+        }
+        let error = commit(&MetadataMirror::default(), &pending.pending_slots).unwrap_err();
+        assert!(error.to_string().contains("source ownership changed"));
+    }
+
+    #[test]
+    fn pending_chunk_source_only_updates_cannot_resurrect_a_slot() {
+        let mut pending = PendingChunkMeta::default();
+        let message = message(100);
+        for index in 1..=16 {
+            pending.push(false, 100, 999, index, &message, Some(Arc::from("one")));
+        }
+        assert_eq!(pending.pending_slots.len(), 1);
+        assert!(!pending.pending_slots[0].init);
+        let result = commit(&MetadataMirror::default(), &pending.pending_slots).unwrap();
+        assert!(result.new_slots.is_empty());
+        assert!(result.updated_slots.is_empty());
+    }
+
+    #[test]
+    fn pending_chunk_ignored_source_before_init_cannot_claim_the_new_slot() {
+        let mut pending = PendingChunkMeta::default();
+        let message = message(100);
+        pending.push(false, 100, 999, 1, &message, Some(Arc::from("old")));
+        pending.push(true, 100, 2, 2, &message, None);
+        pending.push(false, 100, 999, 3, &message, Some(Arc::from("new")));
+        let result = commit(&MetadataMirror::default(), &pending.pending_slots).unwrap();
+        assert_eq!(result.new_slots.len(), 1);
+        assert_eq!(result.new_slots[0].first_index, 2);
+        assert_eq!(result.new_slots[0].source.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn pending_chunk_ordinary_records_need_no_slot_metadata() {
+        let mut pending = PendingChunkMeta::default();
+        let message = message(100);
+        for index in 1..=1_024 {
+            pending.push(false, 100, 1, index, &message, None);
+        }
+        assert_eq!(pending.record_count, 1_024);
+        assert!(pending.pending_slots.is_empty());
+    }
+
+    #[test]
+    fn late_source_update_preserves_existing_replay_start() {
+        let result = commit(
+            &catalog(None),
+            &[PendingSlot {
+                init: false,
+                slot: 100,
+                first_index: 999,
+                source: Some(Arc::from("one")),
+            }],
+        )
+        .unwrap();
+        assert!(result.new_slots.is_empty());
+        assert_eq!(result.updated_slots.len(), 1);
+        let slot = &result.updated_slots[0];
+        assert_eq!(
+            (slot.first_index, slot.segment_id, slot.finalized),
+            (1, 2, true)
+        );
+        assert_eq!(slot.source.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn repeated_init_preserves_original_start_and_owner() {
+        let result = commit(
+            &catalog(Some("one")),
+            &[PendingSlot {
+                init: true,
+                slot: 100,
+                first_index: 999,
+                source: None,
+            }],
+        )
+        .unwrap();
+        assert!(result.new_slots.is_empty());
+        assert_eq!(result.updated_slots.len(), 1);
+        let slot = &result.updated_slots[0];
+        assert_eq!((slot.first_index, slot.segment_id), (1, 2));
+        assert_eq!(slot.source.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn source_update_in_initial_chunk_keeps_first_record_index() {
+        let result = commit(
+            &MetadataMirror::default(),
+            &[
+                PendingSlot {
+                    init: true,
+                    slot: 100,
+                    first_index: 1,
+                    source: None,
+                },
+                PendingSlot {
+                    init: false,
+                    slot: 100,
+                    first_index: 999,
+                    source: Some(Arc::from("one")),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(result.updated_slots.is_empty());
+        assert_eq!(result.new_slots.len(), 1);
+        assert_eq!(result.new_slots[0].first_index, 1);
+        assert_eq!(result.new_slots[0].source.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn source_only_update_does_not_recreate_absent_or_trimmed_slot() {
+        let result = commit(
+            &MetadataMirror::default(),
+            &[PendingSlot {
+                init: false,
+                slot: 100,
+                first_index: 999,
+                source: Some(Arc::from("one")),
+            }],
+        )
+        .unwrap();
+        assert!(result.new_slots.is_empty());
+        assert!(result.updated_slots.is_empty());
+    }
+
+    #[test]
+    fn source_update_cannot_replace_an_existing_owner() {
+        assert!(
+            commit(
+                &catalog(Some("one")),
+                &[PendingSlot {
+                    init: false,
+                    slot: 100,
+                    first_index: 999,
+                    source: Some(Arc::from("two")),
+                }]
+            )
+            .is_err()
+        );
+    }
 }

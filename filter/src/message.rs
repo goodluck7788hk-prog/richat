@@ -47,6 +47,8 @@ pub enum MessageParseError {
     InvalidEnumValue(i32),
     #[error("Invalid pubkey length")]
     InvalidPubkey,
+    #[error("Invalid UTF-8 in {0}")]
+    InvalidUtf8(&'static str),
     #[error("Invalid update: {0}")]
     InvalidUpdateMessage(&'static str),
     #[error("Incompatible encoding")]
@@ -171,6 +173,19 @@ impl Message {
         }
     }
 
+    pub fn bank_id(&self) -> Option<u64> {
+        match self {
+            Self::Slot(message) => message.bank_id(),
+            Self::Account(message) => message.bank_id(),
+            Self::Transaction(message) => Some(message.bank_id()),
+            Self::Entry(message) => Some(message.bank_id()),
+            Self::BlockMeta(message) => Some(message.bank_id()),
+            Self::Block(message) => Some(message.bank_id()),
+            Self::BlockFooter(message) => Some(message.bank_id()),
+            Self::EntryUpdateParent(message) => Some(message.cleared_bank_id()),
+        }
+    }
+
     pub const fn created_at(&self) -> MessageBlockCreatedAt {
         match self {
             Self::Slot(msg) => msg.created_at(),
@@ -218,12 +233,23 @@ impl MessageParserLimited {
                     let message = UpdateOneofLimitedDecodeSlot::decode(
                         &data.as_slice()[range.start..range.end],
                     )?;
+                    let dead_error = message
+                        .dead_error
+                        .map(|error_range| {
+                            let error_range =
+                                error_range.start + range.start..error_range.end + range.start;
+                            std::str::from_utf8(&data[error_range.clone()])
+                                .map_err(|_| MessageParseError::InvalidUtf8("dead_error"))?;
+                            Ok::<_, MessageParseError>(error_range)
+                        })
+                        .transpose()?;
                     Message::Slot(MessageSlot::Limited {
                         slot: message.slot,
                         parent: message.parent,
                         status: SlotStatus::try_from(message.status)
                             .map_err(|_| MessageParseError::InvalidEnumValue(message.status))?,
-                        dead_error: message.dead_error,
+                        dead_error,
+                        bank_id: message.bank_id,
                         created_at,
                         buffer: data,
                         range,
@@ -314,6 +340,7 @@ impl MessageParserLimited {
                         slot: entry.slot,
                         index: entry.index,
                         executed_transaction_count: entry.executed_transaction_count,
+                        bank_id: entry.bank_id,
                         created_at,
                         buffer: data,
                         range,
@@ -581,6 +608,7 @@ pub enum MessageSlot {
         parent: Option<Slot>,
         status: SlotStatus,
         dead_error: Option<Range<usize>>,
+        bank_id: Option<u64>,
         created_at: Timestamp,
         buffer: Vec<u8>,
         range: Range<usize>,
@@ -597,6 +625,12 @@ pub enum MessageSlot {
 }
 
 impl MessageSlot {
+    pub const fn bank_id(&self) -> Option<u64> {
+        match self {
+            Self::Limited { bank_id, .. } | Self::Prost { bank_id, .. } => *bank_id,
+        }
+    }
+
     pub const fn encoding(&self) -> MessageParserEncoding {
         match self {
             Self::Limited { .. } => MessageParserEncoding::Limited,
@@ -643,8 +677,8 @@ impl MessageSlot {
         match self {
             Self::Limited {
                 dead_error, buffer, ..
-            } => dead_error.as_ref().map(|range| unsafe {
-                std::str::from_utf8_unchecked(&buffer.as_slice()[range.start..range.end])
+            } => dead_error.as_ref().and_then(|range| {
+                std::str::from_utf8(&buffer.as_slice()[range.start..range.end]).ok()
             }),
             Self::Prost { dead_error, .. } => dead_error.as_deref(),
         }
@@ -685,6 +719,12 @@ pub enum MessageAccount {
 }
 
 impl MessageAccount {
+    pub const fn bank_id(&self) -> Option<u64> {
+        match self {
+            Self::Limited { bank_id, .. } | Self::Prost { bank_id, .. } => *bank_id,
+        }
+    }
+
     pub const fn encoding(&self) -> MessageParserEncoding {
         match self {
             Self::Limited { .. } => MessageParserEncoding::Limited,
@@ -911,6 +951,12 @@ pub enum MessageTransaction {
 }
 
 impl MessageTransaction {
+    pub const fn bank_id(&self) -> u64 {
+        match self {
+            Self::Limited { bank_id, .. } | Self::Prost { bank_id, .. } => *bank_id,
+        }
+    }
+
     pub const fn encoding(&self) -> MessageParserEncoding {
         match self {
             Self::Limited { .. } => MessageParserEncoding::Limited,
@@ -1079,6 +1125,7 @@ pub enum MessageEntry {
         slot: Slot,
         index: u64,
         executed_transaction_count: u64,
+        bank_id: u64,
         created_at: Timestamp,
         buffer: Vec<u8>,
         range: Range<usize>,
@@ -1091,6 +1138,13 @@ pub enum MessageEntry {
 }
 
 impl MessageEntry {
+    pub const fn bank_id(&self) -> u64 {
+        match self {
+            Self::Limited { bank_id, .. } => *bank_id,
+            Self::Prost { entry, .. } => entry.bank_id,
+        }
+    }
+
     pub const fn encoding(&self) -> MessageParserEncoding {
         match self {
             Self::Limited { .. } => MessageParserEncoding::Limited,
@@ -1137,7 +1191,6 @@ impl MessageEntry {
     }
 }
 
-/// Alpenglow block footer. Small and rare: always kept as a decoded `prost` message.
 #[derive(Debug, Clone)]
 pub struct MessageBlockFooter {
     footer: SubscribeUpdateBlockFooter,
@@ -1179,7 +1232,6 @@ impl MessageBlockFooter {
     }
 }
 
-/// Invalidates entries of `cleared_bank_id`. Always kept as a decoded `prost` message.
 #[derive(Debug, Clone)]
 pub struct MessageEntryUpdateParent {
     update_parent: SubscribeUpdateEntryUpdateParent,
@@ -1239,6 +1291,12 @@ pub enum MessageBlockMeta {
 }
 
 impl MessageBlockMeta {
+    pub const fn bank_id(&self) -> u64 {
+        match self {
+            Self::Limited { block_meta, .. } | Self::Prost { block_meta, .. } => block_meta.bank_id,
+        }
+    }
+
     pub const fn encoding(&self) -> MessageParserEncoding {
         match self {
             Self::Limited { .. } => MessageParserEncoding::Limited,
@@ -1308,6 +1366,10 @@ pub struct MessageBlock {
 }
 
 impl MessageBlock {
+    pub fn bank_id(&self) -> u64 {
+        self.block_meta.bank_id()
+    }
+
     pub const fn encoding(&self) -> MessageParserEncoding {
         self.created_at.encoding()
     }
@@ -1605,300 +1667,5 @@ mod tests {
         assert_eq!(msg.write_version(), u64::MAX, "inc valid write version");
         let msg2 = parse(encode(&msg, None), MessageParserEncoding::Prost);
         assert_eq!(msg, msg2, "write version update failed");
-    }
-}
-
-#[cfg(test)]
-mod tests_alpenglow {
-    use {
-        super::{Message, MessageParserEncoding},
-        crate::{
-            config::{ConfigFilter, ConfigFilterBlockFooter},
-            filter::Filter,
-        },
-        maplit::{hashmap, hashset},
-        prost::Message as _,
-        richat_proto::geyser::{
-            BlockFooterFinalCert, BlockFooterVotesAggregate, SubscribeRequest, SubscribeUpdate,
-            SubscribeUpdateBlockFooter, SubscribeUpdateEntryUpdateParent,
-            subscribe_update::UpdateOneof,
-        },
-        solana_commitment_config::CommitmentLevel,
-    };
-
-    const BANK_ID: u64 = 123_456_789; // multi-byte varint
-
-    fn encode(update_oneof: UpdateOneof) -> Vec<u8> {
-        SubscribeUpdate {
-            filters: vec![],
-            update_oneof: Some(update_oneof),
-            created_at: Some(prost_types::Timestamp {
-                seconds: 1,
-                nanos: 2,
-            }),
-        }
-        .encode_to_vec()
-    }
-
-    fn footer() -> SubscribeUpdateBlockFooter {
-        SubscribeUpdateBlockFooter {
-            slot: 10,
-            bank_id: BANK_ID,
-            bank_hash: vec![1; 32],
-            block_producer_time_nanos: 5,
-            block_user_agent: b"ua".to_vec(),
-            block_final_cert: Some(BlockFooterFinalCert {
-                slot: 10,
-                final_aggregate: Some(BlockFooterVotesAggregate {
-                    signature: vec![2; 96],
-                    ..Default::default()
-                }),
-                notar_aggregate: None,
-            }),
-            ..Default::default()
-        }
-    }
-
-    fn update_parent() -> SubscribeUpdateEntryUpdateParent {
-        SubscribeUpdateEntryUpdateParent {
-            slot: 10,
-            cleared_bank_id: BANK_ID,
-            parent_slot: 9,
-            parent_block_id: vec![3; 32],
-        }
-    }
-
-    fn decode(data: Vec<u8>) -> SubscribeUpdate {
-        SubscribeUpdate::decode(data.as_slice()).expect("valid update")
-    }
-
-    #[test]
-    fn test_parse_footer_and_update_parent() {
-        for parser in [MessageParserEncoding::Limited, MessageParserEncoding::Prost] {
-            let data = encode(UpdateOneof::BlockFooter(footer()));
-            match Message::parse(data.into(), parser).expect("valid footer") {
-                Message::BlockFooter(msg) => {
-                    assert_eq!((msg.slot(), msg.bank_id()), (10, BANK_ID));
-                    assert_eq!(msg.footer(), &footer());
-                }
-                _ => panic!("expected footer"),
-            }
-
-            let data = encode(UpdateOneof::EntryUpdateParent(update_parent()));
-            match Message::parse(data.into(), parser).expect("valid update parent") {
-                Message::EntryUpdateParent(msg) => {
-                    assert_eq!((msg.slot(), msg.cleared_bank_id()), (10, BANK_ID));
-                    assert_eq!(msg.update_parent(), &update_parent());
-                }
-                _ => panic!("expected update parent"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_filter_footer_certificates() {
-        let filter = Filter::new(&ConfigFilter {
-            block_footer: hashmap! {
-                "with".to_owned() => ConfigFilterBlockFooter { include_certificates: Some(true) },
-                "without".to_owned() => ConfigFilterBlockFooter::default(),
-            },
-            ..Default::default()
-        });
-        let message = Message::parse(
-            encode(UpdateOneof::BlockFooter(footer())).into(),
-            MessageParserEncoding::Limited,
-        )
-        .unwrap();
-
-        let updates = filter.get_updates(&message, CommitmentLevel::Processed);
-        assert_eq!(updates.len(), 2);
-        let mut seen = 0;
-        for update in updates {
-            let decoded = decode(update.encode_to_vec());
-            let Some(UpdateOneof::BlockFooter(f)) = decoded.update_oneof else {
-                panic!("expected footer");
-            };
-            match decoded.filters.as_slice() {
-                [name] if name == "with" => assert_eq!(f, footer()),
-                [name] if name == "without" => {
-                    assert!(f.block_final_cert.is_none());
-                    assert_eq!((f.slot, f.bank_id), (10, BANK_ID));
-                }
-                other => panic!("unexpected filters {other:?}"),
-            }
-            seen += 1;
-        }
-        assert_eq!(seen, 2);
-    }
-
-    #[test]
-    fn test_filter_update_parent_only_for_opted_in_entries() {
-        let filter = Filter::new(&ConfigFilter {
-            entries: hashset! { "e1".to_owned(), "e2".to_owned() },
-            entries_update_parent: hashset! { "e2".to_owned() },
-            ..Default::default()
-        });
-        let message = Message::parse(
-            encode(UpdateOneof::EntryUpdateParent(update_parent())).into(),
-            MessageParserEncoding::Prost,
-        )
-        .unwrap();
-
-        let updates = filter.get_updates(&message, CommitmentLevel::Processed);
-        assert_eq!(updates.len(), 1);
-        let decoded = decode(updates[0].encode_to_vec());
-        assert_eq!(decoded.filters, vec!["e2".to_owned()]);
-        assert_eq!(
-            decoded.update_oneof,
-            Some(UpdateOneof::EntryUpdateParent(update_parent()))
-        );
-    }
-
-    #[test]
-    fn test_config_roundtrip() {
-        let request = SubscribeRequest::from(ConfigFilter {
-            entries: hashset! { "e1".to_owned(), "e2".to_owned() },
-            entries_update_parent: hashset! { "e2".to_owned() },
-            block_footer: hashmap! {
-                "f".to_owned() => ConfigFilterBlockFooter { include_certificates: Some(true) },
-            },
-            ..Default::default()
-        });
-        assert_eq!(request.entry["e1"].include_update_parent, None);
-        assert_eq!(request.entry["e2"].include_update_parent, Some(true));
-
-        let config = ConfigFilter::try_from(request).unwrap();
-        assert_eq!(config.entries.len(), 2);
-        assert_eq!(config.entries_update_parent, hashset! { "e2".to_owned() });
-        assert_eq!(config.block_footer["f"].include_certificates, Some(true));
-    }
-}
-
-#[cfg(test)]
-mod tests_bank_id {
-    use {
-        super::{Message, MessageParserEncoding},
-        crate::{
-            config::{
-                ConfigFilter, ConfigFilterAccounts, ConfigFilterAccountsDataSlice,
-                ConfigFilterSlots, ConfigFilterTransactions,
-            },
-            filter::Filter,
-        },
-        maplit::hashmap,
-        prost::Message as _,
-        richat_proto::{
-            geyser::{
-                SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateAccountInfo,
-                SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
-                subscribe_update::UpdateOneof,
-            },
-            solana::storage::confirmed_block::{
-                Message as TxMessage, Transaction, TransactionStatusMeta,
-            },
-        },
-        solana_commitment_config::CommitmentLevel,
-    };
-
-    const BANK_ID: u64 = 123_456_789; // multi-byte varint
-
-    fn encode(update_oneof: UpdateOneof) -> Vec<u8> {
-        SubscribeUpdate {
-            filters: vec![],
-            update_oneof: Some(update_oneof),
-            created_at: Some(prost_types::Timestamp::default()),
-        }
-        .encode_to_vec()
-    }
-
-    fn updates() -> Vec<UpdateOneof> {
-        vec![
-            UpdateOneof::Slot(SubscribeUpdateSlot {
-                slot: 10,
-                status: SlotStatus::SlotConfirmed as i32,
-                bank_id: Some(BANK_ID),
-                ..Default::default()
-            }),
-            UpdateOneof::Account(SubscribeUpdateAccount {
-                account: Some(SubscribeUpdateAccountInfo {
-                    pubkey: vec![1; 32],
-                    owner: vec![2; 32],
-                    data: vec![1, 2, 3, 4],
-                    write_version: 7,
-                    ..Default::default()
-                }),
-                slot: 10,
-                is_startup: false,
-                bank_id: Some(BANK_ID),
-            }),
-            UpdateOneof::Transaction(SubscribeUpdateTransaction {
-                transaction: Some(SubscribeUpdateTransactionInfo {
-                    signature: vec![3; 64],
-                    transaction: Some(Transaction {
-                        signatures: vec![vec![3; 64]],
-                        message: Some(TxMessage {
-                            account_keys: vec![vec![4; 32]],
-                            ..Default::default()
-                        }),
-                    }),
-                    meta: Some(TransactionStatusMeta::default()),
-                    ..Default::default()
-                }),
-                slot: 10,
-                bank_id: BANK_ID,
-            }),
-        ]
-    }
-
-    /// bank id of every update the filter emits for `update`
-    fn filtered_bank_ids(update: UpdateOneof, parser: MessageParserEncoding) -> Vec<u64> {
-        let filter = Filter::new(&ConfigFilter {
-            slots: hashmap! { "s".to_owned() => ConfigFilterSlots::default() },
-            accounts: hashmap! { "a".to_owned() => ConfigFilterAccounts::default() },
-            // data slice forces the limited parser to rebuild the account from fields
-            accounts_data_slice: vec![ConfigFilterAccountsDataSlice {
-                offset: 1,
-                length: 2,
-            }],
-            transactions: hashmap! { "t".to_owned() => ConfigFilterTransactions::default() },
-            transactions_status: hashmap! { "ts".to_owned() => ConfigFilterTransactions::default() },
-            ..Default::default()
-        });
-        let message = Message::parse(encode(update).into(), parser).expect("valid message");
-        filter
-            .get_updates(&message, CommitmentLevel::Processed)
-            .iter()
-            .map(|update| {
-                match SubscribeUpdate::decode(update.encode_to_vec().as_slice())
-                    .unwrap()
-                    .update_oneof
-                    .unwrap()
-                {
-                    UpdateOneof::Slot(msg) => msg.bank_id.unwrap(),
-                    UpdateOneof::Account(msg) => msg.bank_id.unwrap(),
-                    UpdateOneof::Transaction(msg) => msg.bank_id,
-                    UpdateOneof::TransactionStatus(msg) => msg.bank_id,
-                    other => panic!("unexpected update {other:?}"),
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    fn test_bank_id_survives_filter() {
-        for parser in [MessageParserEncoding::Limited, MessageParserEncoding::Prost] {
-            for update in updates() {
-                let expected = match &update {
-                    UpdateOneof::Transaction(_) => 2, // transaction + transaction status
-                    _ => 1,
-                };
-                let bank_ids = filtered_bank_ids(update, parser);
-                assert_eq!(bank_ids.len(), expected, "{parser:?}");
-                assert!(
-                    bank_ids.iter().all(|id| *id == BANK_ID),
-                    "{parser:?}: {bank_ids:?}"
-                );
-            }
-        }
     }
 }

@@ -177,7 +177,6 @@ impl PubSubServer {
                 });
 
                 let acceptor = acceptor.clone();
-                let clients_tx = clients_tx.clone();
                 tokio::spawn(async move {
                     let builder = ServerBuilder::new(TokioExecutor::new());
                     let served_result = if let Some(acceptor) = acceptor {
@@ -198,7 +197,6 @@ impl PubSubServer {
                     if let Err(error) = served_result {
                         error!("Error serving HTTP connection: {error:?}");
                     }
-                    let _ = clients_tx.send(ClientRequest::Remove { client_id }).await;
                 });
 
                 client_id += 1;
@@ -225,6 +223,10 @@ impl PubSubServer {
         mut notifications: broadcast::Receiver<RpcNotification>,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
+        let _registration = ClientRegistration {
+            client_id,
+            clients_tx: clients_tx.clone(),
+        };
         let mut ws = ws_fut.await?;
         ws.set_max_message_size(recv_max_message_size);
         ws.set_auto_pong(false);
@@ -233,7 +235,7 @@ impl PubSubServer {
         let mut ws_rx = FragmentCollectorRead::new(ws_rx);
 
         let (read_tx, read_rx) = kanal::bounded_async::<WriteRequest>(1);
-        let read_fut = tokio::spawn(async move {
+        let read_fut = async move {
             let mut send_frame = None;
             let mut last_frame = false;
             let mut send_fn = |_| async { Ok::<(), String>(()) };
@@ -292,15 +294,20 @@ impl PubSubServer {
                 }
             }
             Ok::<(), anyhow::Error>(())
-        })
-        .map_err(anyhow::Error::new)
-        .and_then(ready);
+        };
 
-        let write_fut = tokio::spawn(async move {
-            let mut subscriptions = IntMap::<SubscriptionId, SubscribeMethod>::default();
+        let write_fut = async move {
+            let mut subscriptions = ClientSubscriptions {
+                methods: IntMap::default(),
+                x_subscription_id: Arc::clone(&x_subscription_id),
+            };
+            let read_requests = read_rx.recv();
+            tokio::pin!(read_requests);
             let maybe_close_reason = loop {
                 tokio::select! {
-                    message = read_rx.recv() => match message {
+                    message = &mut read_requests => {
+                        read_requests.set(read_rx.recv());
+                        match message {
                         Ok(WriteRequest::Frame { frame, tx }) => {
                             ws_tx.write_frame(frame).await?;
                             let _ = tx.send(());
@@ -327,7 +334,7 @@ impl PubSubServer {
                                     }
                                     let removed = rx.await?;
                                     if removed {
-                                        if let Some(method) = subscriptions.remove(&id) {
+                                        if let Some(method) = subscriptions.methods.remove(&id) {
                                             gauge!(
                                                 metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
                                                 "x_subscription_id" => Arc::clone(&x_subscription_id),
@@ -354,7 +361,7 @@ impl PubSubServer {
                                         break Some("shutdown".as_bytes());
                                     }
                                     let (id, method) = rx.await?;
-                                    subscriptions.insert(id, method);
+                                    subscriptions.methods.insert(id, method);
                                     gauge!(
                                         metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
                                         "x_subscription_id" => Arc::clone(&x_subscription_id),
@@ -379,12 +386,13 @@ impl PubSubServer {
                             ws_tx.write_frame(frame).await?;
                             let _ = tx.send(());
                         },
-                        Err(_) => break None, // means shutdown
+                        Err(_) => break None,
+                        }
                     },
                     message = notifications.recv() => match message {
-                        Ok(notification) if subscriptions.contains_key(&notification.subscription_id) => {
+                        Ok(notification) if subscriptions.methods.contains_key(&notification.subscription_id) => {
                             if notification.is_final
-                                && let Some(method) = subscriptions.remove(&notification.subscription_id)
+                                && let Some(method) = subscriptions.methods.remove(&notification.subscription_id)
                             {
                                 gauge!(
                                     metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
@@ -428,20 +436,44 @@ impl PubSubServer {
                 let frame = Frame::close(CloseCode::Away.into(), close_reason);
                 ws_tx.write_frame(frame).await?;
             }
-            for (_subscription_id, method) in subscriptions {
-                gauge!(
-                    metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
-                    "x_subscription_id" => Arc::clone(&x_subscription_id),
-                    "method" => method.as_str()
-                )
-                .decrement(1);
-            }
             Ok::<(), anyhow::Error>(())
-        })
-        .map_err(anyhow::Error::new)
-        .and_then(ready);
+        };
 
-        tokio::try_join!(read_fut, write_fut).map(|((), ())| ())
+        tokio::select! {
+            result = read_fut => result,
+            result = write_fut => result,
+        }
+    }
+}
+
+struct ClientRegistration {
+    client_id: ClientId,
+    clients_tx: kanal::AsyncSender<ClientRequest>,
+}
+
+struct ClientSubscriptions {
+    methods: IntMap<SubscriptionId, SubscribeMethod>,
+    x_subscription_id: Arc<str>,
+}
+
+impl Drop for ClientSubscriptions {
+    fn drop(&mut self) {
+        for method in self.methods.values() {
+            gauge!(metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
+                "x_subscription_id" => Arc::clone(&self.x_subscription_id),
+                "method" => method.as_str())
+            .decrement(1);
+        }
+    }
+}
+
+impl Drop for ClientRegistration {
+    fn drop(&mut self) {
+        let client_id = self.client_id;
+        let clients_tx = self.clients_tx.clone();
+        tokio::spawn(async move {
+            let _ = clients_tx.send(ClientRequest::Remove { client_id }).await;
+        });
     }
 }
 
@@ -476,6 +508,9 @@ fn create_frame_close(frame: Frame) -> Result<Frame, WebSocketError> {
 
     Ok(Frame::close_raw(frame.payload.to_owned().into()))
 }
+
+#[cfg(test)]
+mod stability_tests;
 
 #[cfg(test)]
 mod tests {

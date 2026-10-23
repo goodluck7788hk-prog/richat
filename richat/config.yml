@@ -12,6 +12,8 @@ channel:
     - name: plugin-grpc
       parser: prost # valid: prost, limited
       disable_accounts: false
+      block_footer: false
+      entry_update_parent: false
       exclude_on_finish: false
       reconnect: null
       channel_size: 16384

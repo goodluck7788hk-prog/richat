@@ -35,6 +35,92 @@ use {
 
 type SubscribeStreamInput = BoxStream<'static, Result<Vec<u8>, ReceiveError>>;
 
+#[cfg(test)]
+mod tests {
+    use {
+        super::convert_prost_to_raw,
+        prost::Message as _,
+        richat_proto::geyser::{
+            SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateAccountInfo,
+            SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateSlot,
+            SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
+            subscribe_update::UpdateOneof,
+        },
+        richat_proto::solana::storage::confirmed_block::{
+            Message, MessageHeader, Rewards, Transaction, TransactionStatusMeta,
+        },
+    };
+
+    #[test]
+    fn raw_verification_preserves_bank_id_in_all_supported_updates() {
+        for optional_bank_id in [None, Some(0), Some(123_456_789), Some(u64::MAX)] {
+            let bank_id = optional_bank_id.unwrap_or_default();
+            for update in [
+                UpdateOneof::Account(SubscribeUpdateAccount {
+                    account: Some(SubscribeUpdateAccountInfo {
+                        pubkey: vec![1; 32],
+                        owner: vec![2; 32],
+                        data: vec![3, 4, 5],
+                        write_version: 71,
+                        ..Default::default()
+                    }),
+                    slot: 10,
+                    bank_id: optional_bank_id,
+                    ..Default::default()
+                }),
+                UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot: 10,
+                    parent: Some(9),
+                    status: SlotStatus::SlotConfirmed as i32,
+                    bank_id: optional_bank_id,
+                    ..Default::default()
+                }),
+                UpdateOneof::Entry(SubscribeUpdateEntry {
+                    slot: 10,
+                    index: 4,
+                    bank_id,
+                    ..Default::default()
+                }),
+                UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                    slot: 10,
+                    bank_id,
+                    rewards: Some(Rewards::default()),
+                    ..Default::default()
+                }),
+                UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                    slot: 10,
+                    bank_id,
+                    transaction: Some(SubscribeUpdateTransactionInfo {
+                        signature: vec![3; 64],
+                        transaction: Some(Transaction {
+                            signatures: vec![vec![3; 64]],
+                            message: Some(Message {
+                                header: Some(MessageHeader::default()),
+                                recent_blockhash: vec![4; 32],
+                                versioned: true,
+                                ..Default::default()
+                            }),
+                        }),
+                        meta: Some(TransactionStatusMeta {
+                            return_data_none: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+            ] {
+                let message = SubscribeUpdate {
+                    filters: vec![],
+                    update_oneof: Some(update),
+                    created_at: Some(Default::default()),
+                };
+                let raw = convert_prost_to_raw(&message).unwrap().unwrap();
+                assert_eq!(SubscribeUpdate::decode(raw.as_slice()).unwrap(), message);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct ArgsAppStreamRichat {
     #[command(subcommand)]

@@ -45,6 +45,7 @@ use {
         collections::HashSet,
         fmt,
         future::Future,
+        ops::{Deref, DerefMut},
         pin::Pin,
         sync::{
             Arc, Mutex, MutexGuard,
@@ -256,7 +257,7 @@ impl GrpcServer {
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
         let receiver = messages.to_receiver();
-        let mut head = messages.get_current_tail(CommitmentLevel::Processed) + 1;
+        let mut head = messages.get_next_index(CommitmentLevel::Processed);
 
         const COUNTER_LIMIT: i32 = 10_000;
         let mut counter = 0;
@@ -279,7 +280,9 @@ impl GrpcServer {
 
             if matches!(
                 message,
-                ParsedMessage::Slot(_) | ParsedMessage::BlockMeta(_)
+                ParsedMessage::Slot(_)
+                    | ParsedMessage::BlockMeta(_)
+                    | ParsedMessage::EntryUpdateParent(_)
             ) {
                 block_meta.push(message);
             }
@@ -454,46 +457,35 @@ impl GrpcServer {
             let client = client.clone();
             let x_subscription_id = Arc::clone(&x_subscription_id);
             async move {
-                let mut ts_latest = Instant::now();
+                let ping_interval = ping_interval.max(Duration::from_millis(1));
+                let mut pings = tokio::time::interval_at(
+                    tokio::time::Instant::now() + ping_interval,
+                    ping_interval,
+                );
+                pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let filter_deadline = tokio::time::sleep(Duration::from_secs(3));
+                tokio::pin!(filter_deadline);
                 let mut slow_filter_warned = false;
                 loop {
                     tokio::select! {
+                        () = client.finished.cancelled() => break,
                         () = shutdown.cancelled() => {
                             tracing::error!("push error");
                             client.push_error(Status::internal("shutdown"));
                             break
                         }
-                        () = tokio::time::sleep(Duration::from_millis(500)) => {
-                            let state = client.state_lock();
-                            if state.finished {
-                                break
+                        () = &mut filter_deadline, if !slow_filter_warned => {
+                            slow_filter_warned = true;
+                            if client.state_lock().filter.is_none() {
+                                let elapsed_ms = ts_subscribe_entry.elapsed().as_millis() as u64;
+                                warn!(id, x_subscription_id = x_subscription_id.as_ref(), elapsed_ms,
+                                    "subscribe: filter not set after 3s");
                             }
-                            let filter_set = state.filter.is_some();
-                            drop(state);
-
-                            let ts = Instant::now();
-
-                            // Warn once when a client has been connected for >3s
-                            // without a filter. Matches observed client timeouts.
-                            if !filter_set && !slow_filter_warned {
-                                let elapsed_ms = ts.duration_since(ts_subscribe_entry).as_millis() as u64;
-                                if elapsed_ms > 3_000 {
-                                    slow_filter_warned = true;
-                                    warn!(
-                                        id,
-                                        x_subscription_id = x_subscription_id.as_ref(),
-                                        elapsed_ms,
-                                        "subscribe: filter not set after 3s"
-                                    );
-                                }
-                            }
-
-                            if ts.duration_since(ts_latest) > ping_interval {
-                                ts_latest = ts;
-                                let data = SubscribeClientState::create_ping();
-                                client.push_message(GrpcSubscribeMessage::Ping, data);
-                                client.wake();
-                            }
+                        }
+                        _ = pings.tick() => {
+                            let data = SubscribeClientState::create_ping();
+                            client.push_message(GrpcSubscribeMessage::Ping, data);
+                            client.wake();
                         }
                     }
                 }
@@ -505,11 +497,18 @@ impl GrpcServer {
             let limits = Arc::clone(&self.filter_limits);
             let client = client.clone();
             let messages = self.messages.clone();
+            let shutdown = self.shutdown.clone();
             async move {
                 let mut filter_ever_set = false;
                 let mut handshake_abandoned = false;
                 loop {
-                    match stream.message().await {
+                    let message = tokio::select! {
+                        biased;
+                        () = client.finished.cancelled() => break,
+                        () = shutdown.cancelled() => break,
+                        message = stream.message() => message,
+                    };
+                    match message {
                         Ok(Some(message)) => {
                             if let Some(id) = get_ping(&message) {
                                 let data = SubscribeClientState::create_pong(id);
@@ -827,6 +826,7 @@ pub struct SubscribeClient {
     pub messages_len_max: usize,
     pub messages_replay_len_max: usize,
     waker: Arc<AtomicWaker>,
+    finished: CancellationToken,
     x_subscription_id: Arc<str>,
 }
 
@@ -845,13 +845,17 @@ impl SubscribeClient {
             messages_len_max,
             messages_replay_len_max,
             waker: Arc::new(AtomicWaker::new()),
+            finished: CancellationToken::new(),
             x_subscription_id,
         }
     }
 
     #[inline]
-    pub fn state_lock(&self) -> MutexGuard<'_, SubscribeClientState> {
-        mutex_lock(&self.state)
+    pub fn state_lock(&self) -> SubscribeClientStateGuard<'_> {
+        SubscribeClientStateGuard {
+            state: mutex_lock(&self.state),
+            cancellation: &self.finished,
+        }
     }
 
     pub fn push_message(&self, message: GrpcSubscribeMessage, data: Vec<u8>) {
@@ -868,6 +872,33 @@ impl SubscribeClient {
     /// Wake the stream's poll_next after pushing messages.
     pub fn wake(&self) {
         self.waker.wake();
+    }
+}
+
+pub struct SubscribeClientStateGuard<'a> {
+    state: MutexGuard<'a, SubscribeClientState>,
+    cancellation: &'a CancellationToken,
+}
+
+impl Deref for SubscribeClientStateGuard<'_> {
+    type Target = SubscribeClientState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for SubscribeClientStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for SubscribeClientStateGuard<'_> {
+    fn drop(&mut self) {
+        if self.state.finished {
+            self.cancellation.cancel();
+        }
     }
 }
 
@@ -1014,6 +1045,9 @@ impl Stream for ReceiverStream {
             };
 
             self.finished = item.is_err();
+            if self.finished {
+                self.client.state_lock().finished = true;
+            }
             Poll::Ready(Some(item))
         } else {
             Poll::Pending
@@ -1066,7 +1100,7 @@ impl MessagesCache {
         if head > self.head {
             self.head = head;
         }
-        let inrange = head >= self.head - self.mask;
+        let inrange = head >= self.head.saturating_sub(self.mask);
 
         // return if item cached
         let idx = self.get_idx(head);
@@ -1094,3 +1128,6 @@ struct MessagesCacheItem {
     pos: u64,
     msg: Option<ParsedMessage>,
 }
+
+#[cfg(test)]
+mod stability_tests;
