@@ -70,6 +70,8 @@ pub mod geyser_gen {
     include!(concat!(env!("OUT_DIR"), "/geyser.Geyser.rs"));
 }
 
+pub mod backlog;
+
 #[derive(Debug, Clone)]
 pub struct GrpcServer {
     shutdown: CancellationToken,
@@ -81,6 +83,7 @@ pub struct GrpcServer {
     subscribe_clients: Arc<SegQueue<SubscribeClient>>,
     subscribe_messages_len_max: usize,
     subscribe_messages_replay_len_max: usize,
+    backlog_metrics: backlog::BacklogMetrics,
 }
 
 impl GrpcServer {
@@ -88,6 +91,16 @@ impl GrpcServer {
         config: ConfigAppsGrpc,
         messages: Messages,
         shutdown: CancellationToken,
+    ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>>> {
+        let backlog_metrics = backlog::BacklogMetrics::new(messages.clone());
+        Self::spawn_with_backlog_metrics(config, messages, shutdown, backlog_metrics)
+    }
+
+    pub fn spawn_with_backlog_metrics(
+        config: ConfigAppsGrpc,
+        messages: Messages,
+        shutdown: CancellationToken,
+        backlog_metrics: backlog::BacklogMetrics,
     ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>>> {
         // Create gRPC server
         let (incoming, server_builder) = config.server.create_server_builder()?;
@@ -126,6 +139,7 @@ impl GrpcServer {
             subscribe_clients: Arc::new(SegQueue::new()),
             subscribe_messages_len_max: config.stream.messages_len_max,
             subscribe_messages_replay_len_max: config.stream.messages_replay_len_max,
+            backlog_metrics,
         };
 
         let mut service = geyser_gen::geyser_server::GeyserServer::new(grpc_server.clone())
@@ -449,6 +463,7 @@ impl GrpcServer {
             self.subscribe_messages_replay_len_max,
             Arc::clone(&x_subscription_id),
         );
+        let backlog_registration = self.backlog_metrics.register(id, &request, &client);
         self.push_client(client.clone());
 
         tokio::spawn({
@@ -596,7 +611,9 @@ impl GrpcServer {
             }
         });
 
-        Ok(Response::new(ReceiverStream::new(client)))
+        let mut response = ReceiverStream::new(client);
+        response.backlog_registration = Some(backlog_registration);
+        Ok(Response::new(response))
     }
 }
 
@@ -864,7 +881,11 @@ impl SubscribeClient {
     }
 
     pub fn push_error(&self, error: Status) {
-        while self.messages.pop().is_some() {}
+        while let Some(item) = self.messages.pop() {
+            if let Ok((_, data)) = item {
+                self.messages_len.fetch_sub(data.len(), Ordering::Relaxed);
+            }
+        }
         self.messages.push(Err(error));
         self.waker.wake();
     }
@@ -992,6 +1013,7 @@ impl SubscribeClientState {
 pub struct ReceiverStream {
     client: SubscribeClient,
     finished: bool,
+    backlog_registration: Option<backlog::Registration>,
 }
 
 impl ReceiverStream {
@@ -999,6 +1021,7 @@ impl ReceiverStream {
         Self {
             client,
             finished: false,
+            backlog_registration: None,
         }
     }
 }
@@ -1047,6 +1070,7 @@ impl Stream for ReceiverStream {
             self.finished = item.is_err();
             if self.finished {
                 self.client.state_lock().finished = true;
+                self.backlog_registration.take();
             }
             Poll::Ready(Some(item))
         } else {
@@ -1131,3 +1155,6 @@ struct MessagesCacheItem {
 
 #[cfg(test)]
 mod stability_tests;
+
+#[cfg(test)]
+mod backlog_tests;

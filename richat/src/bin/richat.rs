@@ -8,7 +8,7 @@ use {
     richat::{
         channel::Messages,
         config::Config,
-        grpc::server::GrpcServer,
+        grpc::server::{GrpcServer, backlog::BacklogMetrics},
         pubsub::server::PubSubServer,
         richat::server::RichatServer,
         source::{ReceiveError, Subscriptions},
@@ -182,6 +182,7 @@ fn main() -> anyhow::Result<()> {
         move || {
             let runtime = config.apps.tokio.build_runtime("richatApp")?;
             runtime.block_on(async move {
+                let backlog_metrics = BacklogMetrics::new(messages.clone());
                 let richat_fut = if let Some(config) = config.apps.richat {
                     RichatServer::spawn(config, messages.clone(), shutdown.clone())
                         .await?
@@ -191,7 +192,13 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 let grpc_fut = if let Some(config) = config.apps.grpc {
-                    GrpcServer::spawn(config, messages.clone(), shutdown.clone())?.boxed()
+                    GrpcServer::spawn_with_backlog_metrics(
+                        config,
+                        messages.clone(),
+                        shutdown.clone(),
+                        backlog_metrics.clone(),
+                    )?
+                    .boxed()
                 } else {
                     ready(Ok(())).boxed()
                 };
@@ -208,6 +215,7 @@ fn main() -> anyhow::Result<()> {
                     richat::metrics::spawn_server(
                         config,
                         metrics_handle,
+                        backlog_metrics,
                         is_ready,
                         shutdown.cancelled_owned(),
                     )

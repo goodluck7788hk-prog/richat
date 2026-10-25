@@ -8,7 +8,7 @@ use {
     tonic::codec::Codec,
 };
 
-fn channel(capacity: usize) -> (Messages, Sender) {
+pub(super) fn channel(capacity: usize) -> (Messages, Sender) {
     let (mut messages, threads) = Messages::new(
         MessageParserEncoding::Prost,
         ConfigChannelInner {
@@ -27,7 +27,7 @@ fn channel(capacity: usize) -> (Messages, Sender) {
     (messages, sender)
 }
 
-fn push_slot(sender: &mut Sender, slot: Slot) {
+pub(super) fn push_slot(sender: &mut Sender, slot: Slot) {
     let message = FilterMessage::parse(
         Cow::Owned(
             SubscribeUpdate {
@@ -129,10 +129,11 @@ fn cache_eviction_preserves_window_boundary_and_reports_missing_history() {
     ));
 }
 
-fn server() -> GrpcServer {
+pub(super) fn server() -> GrpcServer {
     let (messages, _) = channel(16);
     GrpcServer {
         shutdown: CancellationToken::new(),
+        backlog_metrics: backlog::BacklogMetrics::new(messages.clone()),
         messages,
         block_meta: None,
         filter_limits: Arc::new(ConfigFilterLimits::default()),
@@ -144,7 +145,9 @@ fn server() -> GrpcServer {
     }
 }
 
-async fn idle_subscription(server: &GrpcServer) -> (ReceiverStream, std::sync::Weak<()>) {
+pub(super) async fn idle_subscription(
+    server: &GrpcServer,
+) -> (ReceiverStream, std::sync::Weak<()>) {
     let probe = Arc::new(());
     let weak = Arc::downgrade(&probe);
     let body = StreamBody::new(stream::poll_fn(move |_context| {
@@ -161,7 +164,7 @@ async fn idle_subscription(server: &GrpcServer) -> (ReceiverStream, std::sync::W
     (response, weak)
 }
 
-async fn request_body_released(probe: std::sync::Weak<()>) {
+pub(super) async fn request_body_released(probe: std::sync::Weak<()>) {
     tokio::time::timeout(Duration::from_millis(100), async {
         while probe.strong_count() != 0 {
             tokio::task::yield_now().await;
@@ -200,4 +203,64 @@ async fn terminal_response_error_cancels_reader_before_response_drop() {
     );
     request_body_released(probe).await;
     server.shutdown.cancel();
+}
+
+#[test]
+fn terminal_error_drains_pending_payload_accounting() {
+    let client = SubscribeClient::new(0, 1_024, 1_024, Arc::from(""));
+    client.push_message(GrpcSubscribeMessage::Ping, vec![0; 19]);
+    client.push_message(GrpcSubscribeMessage::Pong, vec![0; 23]);
+    assert_eq!(client.messages_len.load(Ordering::Relaxed), 42);
+    client.push_error(Status::data_loss("lagged"));
+    assert_eq!(client.messages_len.load(Ordering::Relaxed), 0);
+    client.push_error(Status::cancelled("closed"));
+    assert_eq!(client.messages_len.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn terminal_error_does_not_reset_accounting_of_an_inflight_dequeue() {
+    let client = SubscribeClient::new(0, 1_024, 1_024, Arc::from(""));
+    client.push_message(GrpcSubscribeMessage::Ping, vec![0; 19]);
+    client.push_message(GrpcSubscribeMessage::Pong, vec![0; 23]);
+    let (_, inflight) = client.messages.pop().unwrap().unwrap();
+    client.push_error(Status::data_loss("lagged"));
+    assert_eq!(client.messages_len.load(Ordering::Relaxed), inflight.len());
+    client
+        .messages_len
+        .fetch_sub(inflight.len(), Ordering::Relaxed);
+    assert_eq!(client.messages_len.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn terminal_error_accounting_survives_concurrent_push_pop_and_drain() {
+    let client = SubscribeClient::new(0, 1_024, 1_024, Arc::from(""));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let producer = std::thread::spawn({
+        let client = client.clone();
+        move || {
+            for size in 1..=2_000 {
+                client.push_message(GrpcSubscribeMessage::Ping, vec![0; size % 31 + 1]);
+            }
+        }
+    });
+    let consumer = std::thread::spawn({
+        let client = client.clone();
+        let done = Arc::clone(&done);
+        move || {
+            while !done.load(Ordering::Acquire) || !client.messages.is_empty() {
+                if let Some(Ok((_, data))) = client.messages.pop() {
+                    client.messages_len.fetch_sub(data.len(), Ordering::Relaxed);
+                }
+                std::thread::yield_now();
+            }
+        }
+    });
+    for _ in 0..2_000 {
+        client.push_error(Status::cancelled("closed"));
+        std::thread::yield_now();
+    }
+    producer.join().unwrap();
+    done.store(true, Ordering::Release);
+    consumer.join().unwrap();
+    assert_eq!(client.messages_len.load(Ordering::Relaxed), 0);
 }

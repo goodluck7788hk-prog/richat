@@ -1,5 +1,5 @@
 use {
-    crate::version::VERSION as VERSION_INFO,
+    crate::{grpc::server::backlog::BacklogMetrics, version::VERSION as VERSION_INFO},
     ::metrics::{counter, describe_counter, describe_gauge, describe_histogram},
     metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle},
     richat_filter::filter::FilteredUpdateType,
@@ -151,6 +151,7 @@ pub fn setup() -> Result<PrometheusHandle, BuildError> {
 pub async fn spawn_server(
     config: ConfigMetrics,
     handle: PrometheusHandle,
+    backlog: BacklogMetrics,
     is_ready: Arc<AtomicBool>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<impl Future<Output = Result<(), JoinError>>> {
@@ -164,13 +165,19 @@ pub async fn spawn_server(
 
     richat_metrics::spawn_server(
         config,
-        move || handle.render().into_bytes(),     // metrics
+        move || render(&handle, &backlog),
         || true,                                  // health
         move || is_ready.load(Ordering::Relaxed), // ready
         shutdown,
     )
     .await
     .map_err(Into::into)
+}
+
+pub(crate) fn render(handle: &PrometheusHandle, backlog: &BacklogMetrics) -> Vec<u8> {
+    let mut output = handle.render();
+    backlog.append_to(&mut output);
+    output.into_bytes()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
